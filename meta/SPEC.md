@@ -59,6 +59,10 @@ The `.agents/` directory contains machine-readable instruction files that guide 
 - **Concise**: Each file < 200 lines; split into multiple files if longer
 - **Explicit**: When in doubt, make it explicit
 
+### Optional Extended Form
+
+A scope file whose rules require justification to be applied correctly may use the extended form: each Always/Never bullet carries a short rationale clause after an em-dash, and one or more reference sections may follow `## Rules` (a lookup table, a worked recipe, a `- [ ]` verification checklist, a `Sources:` citation list). Do not mix forms within one file — a file is either terse imperatives throughout or extended throughout. The 200-line cap applies either way.
+
 ---
 
 ## File Organization
