@@ -20,6 +20,7 @@ Before starting any task, locate the relevant standards using this hierarchy:
    - **Workflow**: Refer to `.agents/workflow/AGENTS.md` for development methodology and MVP standards.
    - **Code**: Refer to `.agents/code/AGENTS.md` for code quality and documentation standards.
    - **Theme**: Refer to `.agents/theme/AGENTS.md` for CSS-variable color theming standards (shadcn/Tailwind or equivalent).
+   - **Frontend**: Refer to `.agents/frontend/AGENTS.md` for browser interaction verification, element overlap/stacking, and live testing of shared UI components (color tokens stay in `.agents/theme/AGENTS.md`).
 2. **Meta Standards**: Refer to `.agents/meta/SPEC.md` before modifying any rules or creating new `.md` files in this project (`.agents` and subdirectories).
 
 ## Operational Principles
@@ -31,4 +32,4 @@ Before starting any task, locate the relevant standards using this hierarchy:
 - **Sandboxed Execution**: If a Nix flake (`flake.nix`) exists at the repo root, run every command that touches project dependencies — tests, builds, running the app, linting, and any package-manager invocation (e.g. `npm`, `pip`, `cargo`, `go`, `apt`, `brew`) — through `nix develop` (e.g. `nix develop -c <command>`), unless explicitly instructed otherwise. Never install packages, modules, or other dependencies directly on the bare-metal host OS — all dependency installation must happen inside the Nix shell/flake environment, so the host stays unpolluted and the environment stays reproducible.
 
 ---
-*Last Updated: 2026-07-19*
+*Last Updated: 2026-08-21*
