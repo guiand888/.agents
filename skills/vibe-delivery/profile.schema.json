@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "vibe-delivery/profile.schema.json",
+  "title": "vibe-delivery repo profile (.claude/vibe-delivery.yaml)",
+  "description": "Everything site- or repo-specific the vibe-delivery skill needs. The skill itself carries none of it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "repo", "default_branch", "worktree_root", "bookkeeping", "merge", "gates"],
+  "properties": {
+    "version": { "const": 1 },
+    "repo": { "type": "string", "description": "Short repo name, used in labels and worktree names." },
+    "default_branch": { "type": "string" },
+    "remote": { "type": ["string", "null"], "description": "Git remote name (usually origin). null or absent with no_remote: true." },
+    "no_remote": { "type": "boolean", "default": false, "description": "The repo has no remote: nothing is pushed, no MR is opened, the merge stage always stops with needs_owner_decision." },
+    "worktree_root": { "type": "string", "description": "Directory for this repo's worktrees; ~ is expanded." },
+    "bookkeeping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files", "plan_entry_file", "convention"],
+      "properties": {
+        "files": { "type": "array", "items": { "type": "string" }, "description": "Shared tracking files. Stage only your own hunks in them." },
+        "plan_entry_file": { "type": "string", "description": "Where SETUP writes the plan's bookkeeping_entry." },
+        "convention": { "type": "string", "description": "How entries are written and ticked in this repo." }
+      }
+    },
+    "merge": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "open_command": { "type": "string", "description": "Shell template the MR merge stage (and only it) runs to open the MR. Placeholders, substituted shell-quoted: {source}, {target}, {title}, {description_file}." },
+        "command": { "type": "string", "description": "Shell template the MR merge stage runs to merge. Placeholders: {iid}, {sha} (the gated head)." },
+        "mr_exists_command": { "type": "string", "description": "Shell template run in a worktree; must print the number of MRs (any state) whose source branch is {branch}. vibe-run.sh fails a run whose branch has one, since only the merge stage may open MRs." },
+        "notes": { "type": "string" }
+      }
+    },
+    "vm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ssh", "lock"],
+      "properties": {
+        "ssh": { "type": "string", "description": "user@host for the shared VM." },
+        "lock": { "type": "string", "description": "Lock name; runs of packages with needs_vm hold it for their whole vibe session (one user at a time)." },
+        "use_for": { "type": "array", "items": { "type": "string" } },
+        "notes": { "type": "string" }
+      }
+    },
+    "gates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "cmd"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "cmd": { "type": "string", "description": "Run with bash -c in the worktree root. {touched_dirs} expands to ./dir per touched directory matched by paths." },
+          "paths": { "type": "array", "items": { "type": "string" }, "description": "Run only when a touched path matches (bash patterns, * spans /). Absent = always." },
+          "level": { "enum": ["package", "full", "both"], "default": "both", "description": "package = per work package and after each integration; full = MR prep." },
+          "timeout_min": { "type": "integer", "minimum": 1, "default": 60 },
+          "failure_patterns": { "type": "array", "items": { "type": "string" }, "description": "ERE with capture group 1 = a failure id (test name, package)." },
+          "fatal_patterns": { "type": "array", "items": { "type": "string" }, "description": "ERE; any match makes a failure real even if all ids are known." }
+        }
+      }
+    },
+    "known_master_failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "ids", "reason"],
+        "properties": {
+          "id": { "type": "string" },
+          "ids": { "type": "array", "items": { "type": "string" }, "description": "Failure ids (as failure_patterns extract them) that fail on the default branch too." },
+          "signature": { "type": "string", "description": "Text seen in the log, for humans." },
+          "reason": { "type": "string" },
+          "verified": { "type": "string", "description": "Where and when this was reproduced on the default branch." }
+        }
+      }
+    },
+    "re_corpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "rule"],
+      "properties": {
+        "path": { "type": "string" },
+        "rule": { "type": "string" }
+      }
+    },
+    "dev_stack_rules": { "type": "array", "items": { "type": "string" } },
+    "house_rules": { "type": "array", "items": { "type": "string" }, "description": "Other repo rules every agent and vibe prompt must carry." }
+  }
+}

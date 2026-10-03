@@ -1,0 +1,154 @@
+---
+name: vibe-delivery
+description: Multi-scope code delivery where the `vibe` CLI plans and writes the code in git worktrees and Claude agents review, adjudicate, integrate and merge, with delivery and gate results decided by scripts rather than by agent reports. Use when the user asks to deliver one or more scopes (bug fixes, features, close-outs) with vibe, runs /vibe-delivery, or asks for a "vibe delivery" or "vibe workflow". Needs a per-repo profile at .claude/vibe-delivery.yaml.
+---
+
+# vibe-delivery
+
+Deliver several scopes in parallel. `vibe` writes plans and code; Claude agents check them; small scripts decide the facts that agents used to report (did vibe commit, did it stay in scope, did the gates pass, did anyone open an MR early). Everything specific to a repository, its hosts and its forge lives in that repo's profile, `.claude/vibe-delivery.yaml`. This skill holds none of it.
+
+Skill dir: `~/.claude/skills/vibe-delivery/` (written `$SK` below).
+
+## Roles
+
+| Role | Who | Notes |
+|---|---|---|
+| Orchestrator | you (Opus) | pre-flight, launch, monitoring, post-run |
+| Planner | vibe through a Haiku wrapper | writes `.vd-plan.json` in a read-only detached worktree; `check-plan.sh` validates it |
+| Plan review, collision check, adjudication | Fable | review: approve, correct, or one re-plan |
+| Driver | Sonnet | ground truth, the vibe prompt, advisor check, settling the tree between runs; never codes, never pushes |
+| Code | vibe through the Haiku wrapper | `vibe-run.sh` |
+| Gates | Haiku wrapper | `gates.sh` |
+| Reviewer | Sonnet | reads the diff and the gate log; never re-runs builds |
+| Integrator | Sonnet | serial `merge --no-ff` into the integration branch; package gates after each merge, merge undone if they fail |
+| MR prep | vibe through the Haiku wrapper | merges the default branch, runs full gates, ticks bookkeeping (own hunks only), pushes the integration branch; never opens an MR |
+| MR merge | Sonnet | the only stage that opens and merges an MR, and only after the mechanical merge gate |
+
+## Stages
+
+PLAN (vibe, fresh read-only worktree from the profile's base ref) -> PLAN REVIEW (Fable) -> COLLISION (Fable, `must_finish_before`) -> SETUP (Sonnet: integration branch, plan-of-record entry) -> WAVES (packages of a wave in parallel; a wave starts only after the previous wave is integrated) -> INTEGRATE (Sonnet) -> MR PREP (vibe) -> MR MERGE (Sonnet).
+
+Per package: drive (up to `max_vibe_runs` vibe runs, with continuation and settle) -> gates -> review -> adjudicate -> up to `max_fix_rounds` (default 2) fix rounds. Final states: `integrated`, `failed`, `rejected`, `unapproved`, `policy_violation`, `blocked_dependency` (a `depends_on` package was not integrated, so it never ran), `integration_failed`, `integration_gates_failed` (the merge was undone), `blocked_integration` (undoing a failed merge did not work, so the integration branch is unusable and the scope stops for the owner). Every package that is not `integrated` is listed in the result's `dropped`; none is dropped silently.
+
+MR MERGE stops with `needs_owner_decision`, and opens no MR, when any of these holds:
+
+- a package is not integrated and the scope is not in `ship_partial` (a partial ship);
+- a package hit a policy violation;
+- MR prep did not deliver, or the full gates are not ok apart from the profile's `known_master_failures`;
+- the gated head differs from the head MR prep ended on;
+- the profile has no remote, or lacks `merge.open_command`/`merge.command`.
+
+## Mechanical checks (why they exist)
+
+- **Delivered** is computed by `vibe-run.sh`: commits beyond the run's base, a clean tree, no file outside the package's `files`, and no policy violation. A driver's word never counts. (A v1 driver reported "failed" while vibe went on to commit; another package was dropped although its work existed.)
+- **Policy guards**: after each run, `vibe-run.sh` re-fetches the default branch and fails the run if it now contains a commit the run made, and runs the profile's `mr_exists_command` to fail it if an MR exists for its branch. (v1 drivers opened and self-merged MRs before review, one with a fabricated claim.)
+- **Waiting**: vibe and the gates run detached; wrappers wait with `wait --max-wait 540` (under the 10-minute shell cap), so no agent returns while vibe is still working. If a wrapper dies or garbles the copy, the workflow sends a collector that only waits on the same out dir; it never starts a second run.
+- **Environment**: vibe leaks its bundled `LD_LIBRARY_PATH`, which breaks the system `nix`. `vibe-run.sh` starts vibe under `env -u LD_LIBRARY_PATH` with a `nix` shim first on PATH, stdin from `/dev/null` (vibe `-p` hangs on an open stdin), and fresh `GOCACHE`/`GOLANGCI_LINT_CACHE`/`TMPDIR` under the run dir, deleted afterwards. Prompts also forbid text-only turns, which end a `-p` session.
+- **Shared resources**: packages with `needs_vm` hold an exclusive flock (`~/.cache/vibe-delivery/locks/<vm.lock>.lock`) for their whole vibe run, which serializes VM use across scopes, repos and sessions. Worktree paths are unique (`wt.sh` refuses collisions). Shared bookkeeping files are staged hunk by hunk.
+- **Plans**: `check-plan.sh` rejects duplicate ids, `depends_on` that is not in an earlier wave, overlapping same-wave file scopes, file scopes outside the repo, and packages whose `repo_path` is not the scope's repo.
+
+## 1. Pre-flight
+
+Run these before launching. Stop and tell the owner when one fails.
+
+0. **Authorization.** vibe runs with `--trust --yolo` (permission-bypassing). Get the owner's explicit go-ahead for this delivery before launching.
+1. **Profiles.** Each scope's repo has `.claude/vibe-delivery.yaml` that validates against `$SK/profile.schema.json` (`prepare-args.sh` checks this). If a repo has none, write one with the owner; see "Profile" below.
+2. **/tmp and leftovers.** `bash $SK/tmp-check.sh` prints nothing when fine. Otherwise clear finished runs' leftovers first; /tmp is often a RAM-backed tmpfs shared by every session.
+3. **Remote.** For each repo: `git -C <repo> remote get-url <remote>` and `git -C <repo> fetch <remote>`. A repo without a remote must say `no_remote: true`; its scope then ends ready for a local merge by the owner.
+4. **Local lag.** `git -C <repo> rev-list --count <default>..<remote>/<default>`. Report it. The workflow always builds on `<remote>/<default>`, never on the local checkout, and never touches the main checkout's working tree.
+5. **VM.** If any scope may need the profile's VM: confirm nobody holds it (`flock -n ~/.cache/vibe-delivery/locks/<vm.lock>.lock true`), and over ssh that no leftover clusters are running.
+6. **Known master failures.** Read the profile's `known_master_failures` with the owner. If one was fixed on the default branch, remove it from the profile first, or a regression would pass as known.
+7. **vibe.** `vibe --version`; never use `vibe --worktree` (the scripts use `--workdir` on their own worktrees).
+
+## 2. From request to launch
+
+Agree with the owner, per scope: a short key, the repo, a brief (what "done" means, constraints, links to backlog entries), an integration branch name (`<type>/<slug>`), and optionally an existing branch to build on. Ask whether any scope may ship partially (`ship_partial`, default none). Then write a request file in the session's job dir (not /tmp):
+
+```json
+{
+  "run_tag": "2026-10-04a",
+  "today": "2026-10-04",
+  "jobdir": "/path/to/the/session/job/dir",
+  "ship_partial": [],
+  "scopes": [
+    { "key": "short-slug", "repo_path": "/abs/path/to/repo", "brief": "...", "integration_branch": "fix/short-slug" }
+  ]
+}
+```
+
+Optional per scope: `build_on_branch`, `profile_path` (a profile that is not on the checked-out branch yet). Optional top level: `max_fix_rounds` (2), `max_vibe_runs` (3), `max_turns` (150).
+
+```sh
+bash $SK/prepare-args.sh request.json > /dev/null   # writes <jobdir>/vd/<run_tag>/args.json and prints it
+```
+
+Launch with the args file's content as an actual JSON value (not a string), and the absolute script path:
+
+```
+Workflow({ scriptPath: "<home>/.claude/skills/vibe-delivery/workflow.js", args: <contents of args.json> })
+```
+
+`run_tag` must be new for every launch: it names the run dir and the planner worktrees. Integration branch names must be new too, never a branch that ever had a merge request: the merge stage requires that no MR, in any state, exists for the branch before it opens one. To continue earlier work, use a new integration branch with `build_on_branch` pointing at the old one.
+
+## 3. Monitoring
+
+Check in every 20 to 30 minutes, not more often:
+
+- `bash $SK/tmp-check.sh` (quiet when fine).
+- A Sonnet digest agent, read-only: "Summarize progress of the vibe-delivery run in `<rundir>`: for each `<scope>/<package>/run*/result.json` and `gates-*/gates.json`, report delivered/ok, reasons, policy violations; for runs without result.json, report the age of `vibe.log`'s last write and whether its `pid` is alive. Flag a run whose vibe.log has not grown for 20 minutes. Do not modify anything."
+- Do not touch a running vibe process, its worktree or its out dir. A stuck run ends at `--timeout-min` (120 by default) and is then handled by the workflow.
+
+## 4. Post-run
+
+1. Read the result: `summary`, then for each scope `status`, `blockers`, `dropped`, `owner_questions`, `gates_full`.
+2. For `needs_owner_decision`: put the blockers to the owner with plain options. Partial ship: re-launch with the same args plus the scope in `ship_partial` and `resumeFromRunId`; the agents before the merge gate should come back from the cache (ship_partial appears in no prompt), so in practice only the merge stage runs again. A policy violation needs the owner to look at what happened first.
+3. Dropped packages: list each with its final state and reason; each stays open in the repo's bookkeeping with a dated note (MR prep writes it). Propose the follow-up (re-run as a new scope, or by hand).
+4. Clean up: for each `worktrees_to_clean` entry marked finished, `bash $SK/wt.sh remove --repo <repo> --path <path>`; keep failed packages' worktrees until the owner has looked. Then `du -sh <rundir>` (the scripts delete caches; logs stay) and `bash $SK/tmp-check.sh`.
+5. Final report: per scope the status, MR link and merge commit, packages and their final states, gates (naming any known failures hit), dropped work with reasons, and open owner questions.
+
+## Profile (`.claude/vibe-delivery.yaml`)
+
+Schema: `$SK/profile.schema.json`. Fields:
+
+- `version: 1`, `repo`, `default_branch`, `remote` (or `no_remote: true`), `worktree_root` (`~` allowed).
+- `bookkeeping`: `files` (shared tracking files, hunk-staged), `plan_entry_file` (where SETUP writes the plan-of-record entry), `convention` (how entries are written and ticked).
+- `merge`: `open_command` (`{source}`, `{target}`, `{title}`, `{description_file}`), `command` (`{iid}`, `{sha}`), `mr_exists_command` (`{branch}`; prints a count), `notes`.
+- `vm` (optional): `ssh`, `lock` (use the same lock name in every profile that shares the machine), `use_for`, `notes`.
+- `gates[]`: `name`, `cmd` (`{touched_dirs}`/`{touched_files}` placeholders), `paths` (bash patterns, `*` spans `/`), `level` (`package` per package and after each integration, `full` at MR prep, `both`), `timeout_min`, `failure_patterns` (ERE; capture groups make the failure id), `fatal_patterns` (any match makes a failure real).
+- `known_master_failures[]`: `id`, `ids` (failure ids as the patterns extract them), `signature`, `reason`, `verified` (where and when it was reproduced on the default branch).
+- `re_corpus` (optional): `path`, `rule` for prior-art research during planning.
+- `dev_stack_rules[]`, `house_rules[]`: carried into every agent and vibe prompt.
+
+Minimal example (placeholders):
+
+```yaml
+version: 1
+repo: my-service
+default_branch: main
+remote: origin
+worktree_root: ~/worktrees/my-service
+bookkeeping: {files: [TODO.md], plan_entry_file: TODO.md, convention: "- [ ] task, ticked - [x] with a date"}
+merge:
+  open_command: glab mr create --source-branch {source} --target-branch {target} --title {title} --description "$(cat {description_file})" --yes
+  command: glab mr merge {iid} --sha {sha} --yes
+  mr_exists_command: glab api "projects/:id/merge_requests?source_branch={branch}&state=all" | jq length
+gates:
+  - {name: test, cmd: "make test", paths: ["src/*"], failure_patterns: ['^--- FAIL: ([^ /]+)']}
+known_master_failures: []
+```
+
+Split an aggregate target such as `make verify` into its parts when it stops at the first failure: a known test failure would otherwise hide whether the later steps pass.
+
+## Scripts
+
+| Script | Use |
+|---|---|
+| `workflow.js` | the Workflow script; args only from `prepare-args.sh` |
+| `prepare-args.sh REQUEST.json` | resolves and validates profiles, embeds `plan.schema.json`, writes `args.json` |
+| `vibe-run.sh start/wait/run/check` | one vibe session; `result.json` with `delivered`, `out_of_scope`, `policy_violations` |
+| `gates.sh start/wait/run` | the profile's gates for touched paths; `gates.json` with `ok`/`clean` and known-failure classification |
+| `wt.sh create/remove` | unique worktrees; refuses collisions; never removes the main checkout |
+| `check-plan.sh PLAN.json` | schema plus structural plan checks |
+| `tmp-check.sh` | quiet unless /tmp is above the threshold or large stale dirs exist |
+
+`wait` prints `DONE` plus one compact JSON line, `STILL_RUNNING` (exit 75), or `DIED` (exit 70; `vibe-run.sh check --out DIR` recomputes the result from the worktree). Every script drops `LD_LIBRARY_PATH` first, so vibe can call them. Tools come from nixpkgs (`VD_PREFER_PATH=1` uses PATH instead).
