@@ -258,6 +258,7 @@ function guards(s) {
 async function gatesRun(o) {
   const start = [GT, 'start', '--profile', q(o.profileJson), '--wt', q(o.wt), '--base', q(o.base), '--out', q(o.out), '--level', o.level]
   for (const g of o.allow || []) start.push('--allow', q(g))
+  if (o.allowFile) start.push('--allow-file', q(o.allowFile))
   for (const g of o.verifyPaths || []) start.push('--verify-paths', q(g))
   for (const c of o.extraCmds || []) start.push('--extra-cmd', q(c))
   const steps = [
@@ -860,9 +861,11 @@ async function runScope(pl) {
   // ---- MR PREP (vibe), then the full gates once, mechanically; one fix run if they fail ----
   const mdir = RUN + '/' + key + '/mr-prep'
   const allowed = [].concat(...integrated.map((r) => (allPackages(plan).find((k) => k.id === r.id) || { files: [] }).files), p.bookkeeping.files, [p.bookkeeping.plan_entry_file])
+  // The full gates diff the branch against the base ref: inherited work is allowed by file.
+  const inheritedAllow = setup.base.inherited && setup.base.files_file ? setup.base.files_file : ''
   const G = guards(s)
   let mr = await vibeRun({ label: 'mr-prep:' + key + ':1', phase: 'MR prep', wt: setup.integration_worktree, base: setup.head, promptFile: mdir + '/run1/prompt.md', promptText: mrPrompt(s, plan, setup, integrated, notIntegrated, null), out: mdir + '/run1', allow: ['*'], expectCommits: 'yes', guardRefs: G.guardRefs, mrCheckCmd: G.mrCheckCmd })
-  let full = mr.delivered ? await gatesRun({ label: 'gates:' + key + ':full:1', phase: 'MR prep', wt: setup.integration_worktree, base: p.base_ref, out: mdir + '/gates-full-1', level: 'full', profileJson: s.profile_json, allow: allowed }) : null
+  let full = mr.delivered ? await gatesRun({ label: 'gates:' + key + ':full:1', phase: 'MR prep', wt: setup.integration_worktree, base: p.base_ref, out: mdir + '/gates-full-1', level: 'full', profileJson: s.profile_json, allow: allowed, allowFile: inheritedAllow }) : null
   const mrRuns = [mr]
   if (mr.delivered && full && !full.ok && !(mr.policy_violations || []).length) {
     log(key + ': full gates not ok after MR prep (' + gateSummary(full) + '); one vibe fix run')
@@ -870,7 +873,7 @@ async function runScope(pl) {
     mrRuns.push(fix)
     if (fix.delivered) {
       mr = fix
-      full = await gatesRun({ label: 'gates:' + key + ':full:2', phase: 'MR prep', wt: setup.integration_worktree, base: p.base_ref, out: mdir + '/gates-full-2', level: 'full', profileJson: s.profile_json, allow: allowed })
+      full = await gatesRun({ label: 'gates:' + key + ':full:2', phase: 'MR prep', wt: setup.integration_worktree, base: p.base_ref, out: mdir + '/gates-full-2', level: 'full', profileJson: s.profile_json, allow: allowed, allowFile: inheritedAllow })
     }
   }
   const mrPolicy = [].concat(...mrRuns.map((r) => r.policy_violations || []))

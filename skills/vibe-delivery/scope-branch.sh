@@ -20,8 +20,13 @@
 #                       indented by two spaces
 #   OUT/inherited-diff.txt  git diff --name-status <base> HEAD (what the
 #                       branch adds over the base, in total)
+#   OUT/inherited-files.txt the same paths, one per line (the full gates take
+#                       it as --allow-file: inherited work is never out of scope)
+# --build-on resolves to <remote>/BRANCH when --remote is given and that ref
+# exists (the workflow builds on the remote, never on a local checkout), else
+# to the local branch.
 # Prints DONE, then one compact JSON object: ok, worktree, branch, head,
-# base_sha, inherited (count), inherited_file, diff_file, reused.
+# base_sha, inherited (count), inherited_file, diff_file, files_file, reused.
 #
 # refresh merges the (re-fetched) base ref into the integration worktree; a
 # scope that waited for another scope's merge (must_finish_before) runs it so
@@ -86,10 +91,10 @@ case $sub in
     if [[ -n $REMOTE ]]; then git -C "$REPO" fetch -q "$REMOTE" --prune >&2 || fail "git fetch $REMOTE failed"; fi
     from=$BASE_REF
     if [[ -n $BUILD_ON ]]; then
-      if git -C "$REPO" rev-parse --verify -q "$BUILD_ON^{commit}" >/dev/null; then
-        from=$BUILD_ON
-      elif [[ -n $REMOTE ]] && git -C "$REPO" rev-parse --verify -q "$REMOTE/$BUILD_ON^{commit}" >/dev/null; then
+      if [[ -n $REMOTE ]] && git -C "$REPO" rev-parse --verify -q "$REMOTE/$BUILD_ON^{commit}" >/dev/null; then
         from=$REMOTE/$BUILD_ON
+      elif git -C "$REPO" rev-parse --verify -q "$BUILD_ON^{commit}" >/dev/null; then
+        from=$BUILD_ON
       else
         fail "build-on branch $BUILD_ON does not exist${REMOTE:+ locally or on $REMOTE}"
       fi
@@ -120,12 +125,14 @@ case $sub in
       git -C "$WTP" diff-tree --no-commit-id --name-only -r "$c" | sed 's/^/  /' >>"$OUT/inherited.txt"
     done < <(git -C "$WTP" rev-list --no-merges --reverse "$base_sha..HEAD")
     git -C "$WTP" diff --name-status "$base_sha" HEAD >"$OUT/inherited-diff.txt"
+    git -C "$WTP" diff --name-only "$base_sha" HEAD >"$OUT/inherited-files.txt"
     n=$(grep -cE '^[0-9a-f]{40} ' "$OUT/inherited.txt" || true)
     echo DONE
     jq_ -nc --arg wt "$WTP" --arg br "$BRANCH" --arg head "$head" --arg base "$base_sha" --argjson n "${n:-0}" \
-      --arg inh "$OUT/inherited.txt" --arg diff "$OUT/inherited-diff.txt" --argjson reused "$reused" \
+      --arg inh "$OUT/inherited.txt" --arg diff "$OUT/inherited-diff.txt" --arg files "$OUT/inherited-files.txt" \
+      --argjson reused "$reused" \
       '{ok: true, worktree: $wt, branch: $br, head: $head, base_sha: $base, inherited: $n,
-        inherited_file: $inh, diff_file: $diff, reused: $reused}'
+        inherited_file: $inh, diff_file: $diff, files_file: $files, reused: $reused}'
     ;;
   refresh)
     [[ -n $WTP && -n $BASE_REF ]] || die "refresh needs --wt and --base-ref"

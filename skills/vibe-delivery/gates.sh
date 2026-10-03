@@ -5,7 +5,7 @@
 # Part of the vibe-delivery skill.
 #
 #   gates.sh start --profile FILE --wt DIR --base REF --out DIR [--level package|full] [--allow GLOB]...
-#                  [--verify-paths GLOB]... [--extra-cmd CMD]...
+#                  [--allow-file FILE]... [--verify-paths GLOB]... [--extra-cmd CMD]...
 #   gates.sh wait  --out DIR [--max-wait SECS]   # prints DONE | STILL_RUNNING | DIED
 #   gates.sh run   <start args>                  # start + wait to the end (no time cap callers, e.g. vibe)
 #
@@ -13,6 +13,10 @@
 # --base is the ref the branch forked from; touched paths are
 #   git diff --name-only $(git merge-base BASE HEAD) HEAD
 # --allow (optional, repeatable) reports touched files outside those globs.
+# --allow-file FILE (repeatable): every line of FILE is one more allowed path,
+#   matched literally. The full gates diff the whole branch against the base
+#   ref, so work inherited from a build-on branch is passed this way and never
+#   counts as out of scope.
 # --verify-paths GLOB (repeatable): also treat every tracked file matching GLOB
 #   as touched. A verify-only package can end with no commits, which leaves
 #   nothing touched and would skip every path-scoped gate; this makes the
@@ -49,7 +53,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 usage() { sed -n '2,/^set -/{/^#/!d;/shellcheck/d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"; }
 
 PROFILE='' WT='' BASE='' OUT='' LEVEL=package MAX_WAIT=540
-ALLOW=() VERIFY_PATHS=() EXTRA_CMDS=()
+ALLOW=() ALLOW_EXACT=() VERIFY_PATHS=() EXTRA_CMDS=()
 
 parse() {
   while (($#)); do
@@ -60,6 +64,10 @@ parse() {
       --out) OUT=$2; shift 2 ;;
       --level) LEVEL=$2; shift 2 ;;
       --allow) ALLOW+=("$2"); shift 2 ;;
+      --allow-file)
+        [[ -f $2 ]] || die "--allow-file $2 does not exist"
+        mapfile -t -O "${#ALLOW_EXACT[@]}" ALLOW_EXACT < <(sed '/^$/d' "$2")
+        shift 2 ;;
       --verify-paths) VERIFY_PATHS+=("$2"); shift 2 ;;
       --extra-cmd) EXTRA_CMDS+=("$2"); shift 2 ;;
       --max-wait) MAX_WAIT=$2; shift 2 ;;
@@ -89,10 +97,14 @@ runner() {
   # Allowed-path check: only real changes, before the verify paths are added.
   local changed=$touched
   local f
-  if ((${#ALLOW[@]})); then
+  if ((${#ALLOW[@]} + ${#ALLOW_EXACT[@]})); then
+    local x exact
     while IFS= read -r f; do
       [[ -z $f ]] && continue
-      path_allowed "$f" "${ALLOW[@]}" || oos+="$f"$'\n'
+      exact=false
+      for x in "${ALLOW_EXACT[@]+"${ALLOW_EXACT[@]}"}"; do [[ $f == "$x" ]] && { exact=true; break; }; done
+      [[ $exact == true ]] && continue
+      path_allowed "$f" "${ALLOW[@]+"${ALLOW[@]}"}" || oos+="$f"$'\n'
     done <<<"$changed"
   fi
   if ((${#VERIFY_PATHS[@]})); then
@@ -242,7 +254,7 @@ cmd_start() {
   {
     printf 'WT=%q\nBASE_SHA=%q\nLEVEL=%q\n' "$WT" "$BASE_SHA" "$LEVEL"
     local g arr
-    for arr in ALLOW VERIFY_PATHS EXTRA_CMDS; do
+    for arr in ALLOW ALLOW_EXACT VERIFY_PATHS EXTRA_CMDS; do
       local -n ref=$arr
       printf '%s=(' "$arr"
       for g in "${ref[@]+"${ref[@]}"}"; do printf '%q ' "$g"; done
