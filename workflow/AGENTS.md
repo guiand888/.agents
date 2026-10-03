@@ -12,7 +12,7 @@ Batch sizing, incremental delivery, MVP approach, durable task tracking, and mul
 - Deliver features in one week or less
 - Work in small increments for fast feedback
 - Ensure features are useful subsets delivered incrementally
-- Record multi-phase work in the project's durable, checked-in task file before implementing it
+- Record multi-phase work in the project's durable, checked-in task tracker before implementing it — a committed task file or the project's issue tracker, whichever its AGENTS.md designates
 - File a newly scoped phase at scoping time, not at completion
 - Run subagents in parallel, targeting ~5 concurrent, when their file scopes and contexts are genuinely disjoint
 - Confirm scope disjointness against the working tree (`git status`/`git diff`) before dispatching parallel agents
