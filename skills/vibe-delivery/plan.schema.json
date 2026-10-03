@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "vibe-delivery/plan.schema.json",
+  "title": "vibe-delivery scope plan",
+  "description": "Written by the planner (vibe) as .vd-plan.json, validated by check-plan.sh, then reviewed and possibly revised by the plan reviewer. The workflow uses the reviewed plan verbatim. Packages fork from the integration branch, which already holds any inherited commits (a build-on branch merged with the default branch).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scope", "repo_path", "integration_branch", "summary", "re_and_sources", "decisions", "user_decisions_needed", "bookkeeping_entry", "waves", "mr_title", "mr_description"],
+  "properties": {
+    "scope": { "type": "string", "minLength": 1 },
+    "repo_path": { "type": "string", "minLength": 1 },
+    "integration_branch": { "type": "string", "minLength": 1 },
+    "summary": { "type": "string", "minLength": 1 },
+    "re_and_sources": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Prior-art findings (the repo's reverse-engineering corpus rule, if its profile has one) and authoritative sources (URL + fetch date) the plan relies on."
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["decision", "rationale"],
+        "properties": {
+          "decision": { "type": "string" },
+          "rationale": { "type": "string" },
+          "sources": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "user_decisions_needed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Strategic questions only the owner can answer. Empty if none."
+    },
+    "bookkeeping_entry": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Markdown to add to the repo's plan-of-record file (the profile's bookkeeping.plan_entry_file) before the first implementation commit: unchecked tasks with acceptance criteria."
+    },
+    "waves": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["wave", "packages"],
+        "properties": {
+          "wave": { "type": "integer", "minimum": 1 },
+          "packages": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "kind", "repo_path", "title", "branch", "files", "spec", "acceptance", "tests", "needs_vm", "depends_on"],
+              "properties": {
+                "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$", "description": "Short slug, unique in the plan, e.g. wp1-kv-projector." },
+                "kind": {
+                  "enum": ["change", "verify_only"],
+                  "description": "change: the package writes new work and must end with at least one commit. verify_only: the work is already on the integration branch (inherited commits) or needs no change; the package checks it, may end with zero commits, and is delivered by passing gates (its `tests` run as gates) plus a verification note. Never plan a change package that recreates an inherited commit."
+                },
+                "high_risk": {
+                  "type": "boolean",
+                  "description": "Set by the plan reviewer for concurrency, security or data-integrity work. Every package gets one code review; a high-risk package gets it from the senior reviewer instead of the standard one."
+                },
+                "repo_path": { "type": "string", "description": "Must equal the plan's repo_path. Work for another repository belongs to another scope; check-plan.sh rejects a mismatch." },
+                "title": { "type": "string" },
+                "branch": { "type": "string", "description": "<integration_branch>-<id>" },
+                "files": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "string" },
+                  "description": "Every repo-relative path the package may touch: files, directories (trailing /) or bash globs (* spans /). No absolute paths and no '..' segments. Enforced mechanically: anything else makes the run undelivered."
+                },
+                "spec": { "type": "string", "minLength": 1, "description": "Implementation spec precise enough for a coder with no other context." },
+                "acceptance": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                "tests": { "type": "array", "items": { "type": "string" }, "description": "Exact commands that prove the package, run from the repository root. For verify_only packages they are required and are also run mechanically as gates, so they must exit non-zero when the verification fails." },
+                "needs_vm": { "type": "boolean", "description": "True if any step needs the profile's VM (serialized across all lanes)." },
+                "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Ids of packages in earlier waves that must be integrated first. If one is not, this package is skipped and reported." }
+              }
+            }
+          }
+        }
+      }
+    },
+    "mr_title": { "type": "string" },
+    "mr_description": { "type": "string" },
+    "review_notes": { "type": "string", "description": "Filled by the plan reviewer: what changed and why." }
+  }
+}
