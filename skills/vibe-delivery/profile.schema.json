@@ -16,10 +16,11 @@
     "bookkeeping": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["files", "plan_entry_file", "convention"],
+      "required": ["files", "plan_entry_file", "followup_file", "convention"],
       "properties": {
         "files": { "type": "array", "items": { "type": "string" }, "description": "Shared tracking files. Stage only your own hunks in them." },
         "plan_entry_file": { "type": "string", "description": "Where SETUP writes the plan's bookkeeping_entry." },
+        "followup_file": { "type": "string", "description": "Where MR prep files every follow-up: each deferrable review finding of a shipped package and each package that was not integrated, one dated line per item naming the scope, package, branch and finding, tagged [vd:<scope>/<package>]. Usually the repo's backlog file. The convention should say where in it new open items go." },
         "convention": { "type": "string", "description": "How entries are written and ticked in this repo." }
       }
     },

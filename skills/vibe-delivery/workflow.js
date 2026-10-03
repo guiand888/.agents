@@ -1,6 +1,6 @@
 export const meta = {
   name: 'vibe-delivery',
-  description: 'Multi-scope delivery: vibe plans and writes code in worktrees behind thin Haiku wrappers, Fable reviews plans and adjudicates disputed or high-risk packages, one Sonnet reviewer per round, and scripts decide branches, delivery and gate results mechanically.',
+  description: 'Multi-scope delivery: vibe plans and writes code in worktrees behind thin Haiku wrappers; each package is reviewed once (Sonnet, or Fable for high-risk work), only blocking findings get one vibe fix round and a narrow re-check, deferrable findings ship as recorded follow-ups, and scripts decide branches, delivery and gate results mechanically.',
   whenToUse: 'Launched by the vibe-delivery skill with args built by prepare-args.sh; never with hand-written args',
   phases: [
     { title: 'Base', detail: 'scope-branch.sh creates the integration branch (build-on branch merged with the default branch) and lists its inherited commits (Haiku wrapper)', model: 'haiku' },
@@ -9,10 +9,10 @@ export const meta = {
     { title: 'Collision', detail: 'cross-scope overlaps and must_finish_before', model: 'fable' },
     { title: 'Setup', detail: 'scope-branch.sh records the plan-of-record entry and pushes (Haiku wrapper)', model: 'haiku' },
     { title: 'Deliver', detail: 'Haiku wrapper: worktree + vibe-run.sh with a workflow-built prompt; gates.sh' },
-    { title: 'Review', detail: 'one Sonnet reviewer; Fable only on fix/reject or high_risk; fix rounds go straight to vibe' },
-    { title: 'Integrate', detail: 'serial merge of approved packages; gates re-run unless the merge tree equals the gated package tree', model: 'sonnet' },
-    { title: 'MR prep', detail: 'vibe merges the default branch, ticks bookkeeping, pushes the branch (never opens an MR); full gates once, mechanically' },
-    { title: 'MR merge', detail: 'mechanical merge gate, then the only stage that opens and merges the MR', model: 'sonnet' },
+    { title: 'Review', detail: 'one review per package (Sonnet; Fable for high_risk); blocking findings only: one vibe fix round, gates, a narrow Sonnet re-check; deferrable findings become follow-ups' },
+    { title: 'Integrate', detail: 'serial merge of shipped packages (Sonnet, or a script with Sonnet only on conflict); gates re-run unless the merge tree equals the gated package tree' },
+    { title: 'MR prep', detail: 'vibe merges the default branch, ticks bookkeeping, files every follow-up, pushes the branch (never opens an MR); full gates once, mechanically' },
+    { title: 'MR merge', detail: 'mechanical merge gate, then the only stage that opens and merges the MR; always ships what was integrated', model: 'sonnet' },
   ],
 }
 
@@ -31,9 +31,11 @@ for (const s of A.scopes) {
   need(s.key && s.repo_path && s.brief && s.integration_branch, 'scope needs key, repo_path, brief, integration_branch')
   need(s.profile && s.profile.base_ref && s.profile.worktree_root && Array.isArray(s.profile.gates), 'scope ' + s.key + ' has no resolved profile')
   need(typeof s.profile_json === 'string', 'scope ' + s.key + ' has no profile_json path')
+  need(s.profile.bookkeeping && s.profile.bookkeeping.followup_file, 'scope ' + s.key + ' profile has no bookkeeping.followup_file')
 }
-const SHIP_PARTIAL = A.ship_partial || []
-const MAX_FIX = typeof A.max_fix_rounds === 'number' ? A.max_fix_rounds : 2
+// Integrator: 'sonnet' (default) merges with a Sonnet agent; 'script' merges with
+// scope-branch.sh merge behind a Haiku wrapper and calls Sonnet only on a conflict.
+const INTEGRATOR = A.integrator === 'script' ? 'script' : 'sonnet'
 const MAX_RUNS = typeof A.max_vibe_runs === 'number' ? A.max_vibe_runs : 3
 const MAX_TURNS = A.max_turns || 150
 const SK = A.skill_dir
@@ -85,20 +87,37 @@ const COLLISION = {
   },
   required: ['overlaps', 'must_finish_before'],
 }
+// The one review of a package. The workflow, not the verdict, decides the
+// outcome: any blocking finding (or red gates) -> one fix round; none -> ship;
+// reject -> not integrated.
+const FINDING = {
+  type: 'object',
+  properties: {
+    severity: { type: 'string', enum: ['blocking', 'deferrable'] },
+    summary: STR,
+    file: STR,
+    line: { type: 'string', description: 'line or range in file, "" if not applicable' },
+    required_fix: { type: 'string', description: 'what must change, concrete enough for a coder with no other context (file, behaviour, test)' },
+  },
+  required: ['severity', 'summary', 'file', 'line', 'required_fix'],
+}
 const REVIEW = {
   type: 'object',
   properties: {
-    verdict: { type: 'string', enum: ['approve', 'fix', 'reject'] },
-    findings: { type: 'array', items: { type: 'object', properties: { severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] }, file: STR, issue: STR, fix: STR }, required: ['severity', 'issue', 'fix'] } },
+    verdict: { type: 'string', enum: ['ship', 'fix', 'reject'], description: 'ship: no blocking finding; fix: at least one blocking finding; reject: the approach itself is wrong' },
+    findings: { type: 'array', items: FINDING },
     acceptance: { type: 'array', items: { type: 'object', properties: { item: STR, met: { type: 'boolean' }, evidence: STR }, required: ['item', 'met', 'evidence'] } },
-    required_fixes: { type: 'array', items: STR, description: 'for verdict fix: each fix concrete enough for a coder with no other context (file, behaviour, test); empty otherwise' },
+    reject_reason: { type: 'string', description: 'for verdict reject: why the approach is wrong; "" otherwise' },
   },
-  required: ['verdict', 'findings', 'acceptance', 'required_fixes'],
+  required: ['verdict', 'findings', 'acceptance'],
 }
-const ADJ = {
+// The narrow re-check after the one fix round: only the listed blocking items.
+const RECHECK = {
   type: 'object',
-  properties: { verdict: { type: 'string', enum: ['approve', 'fix', 'reject'] }, required_fixes: STRS, rationale: STR },
-  required: ['verdict', 'required_fixes', 'rationale'],
+  properties: {
+    items: { type: 'array', items: { type: 'object', properties: { index: { type: 'integer', description: 'the item number as listed (1-based)' }, resolved: { type: 'boolean' }, evidence: STR }, required: ['index', 'resolved', 'evidence'] } },
+  },
+  required: ['items'],
 }
 const INTEG = {
   type: 'object',
@@ -107,7 +126,13 @@ const INTEG = {
 }
 const MERGE = {
   type: 'object',
-  properties: { merged: { type: 'boolean' }, merge_commit: STR, mr_url: STR, notes: STR },
+  properties: {
+    merged: { type: 'boolean' },
+    merge_commit: STR,
+    mr_url: STR,
+    followups_check: { type: 'string', description: 'the output of the follow-up check command, copied exactly' },
+    notes: STR,
+  },
   required: ['merged', 'notes'],
 }
 
@@ -150,6 +175,18 @@ function gateSummary(g) {
   if (typeof g.ran === 'number') parts.push(g.ran + ' gate(s) ran')
   return (g.ok ? 'ok' : 'NOT ok') + (parts.length ? ': ' + parts.join('; ') : '') + ' (log ' + g.log + ')'
 }
+// Mechanical gate verdict: ok, and for a verify-only package at least one gate
+// ran (its own tests are extra gates), so it cannot pass on nothing.
+const gatesPassed = (g, verify) => !!(g && g.ok && (!verify || g.ran > 0))
+// Red gates are always a blocking item, added by the workflow, not by a reviewer.
+function gateFinding(g, verify) {
+  return {
+    severity: 'blocking', from_gates: true, file: '', line: '',
+    summary: 'gates not ok: ' + gateSummary(g) + (verify && g && !g.ran ? ' (no gate ran at all)' : ''),
+    required_fix: 'Make every gate pass (failures listed in the profile as known master failures are acceptable); the gate log names each failure.',
+  }
+}
+const fixText = (f) => f.summary + (f.file ? ' [' + f.file + (f.line ? ':' + f.line : '') + ']' : '') + ' -> ' + f.required_fix
 const allPackages = (plan) => plan.waves.flatMap((w) => w.packages)
 const isVerify = (pkg) => pkg.kind === 'verify_only'
 
@@ -303,6 +340,7 @@ function planPrompt(s, base, feedback) {
     '',
     inheritedNote(s, base, 'planner'),
     '',
+    s.followups && s.followups.length ? 'FOLLOW-UPS FROM AN EARLIER RUN (part of this scope: plan a package for each, or say in user_decisions_needed why one is dropped; for a package that was not integrated, its branch holds the earlier work and the evidence names its run dir):\n' + JSON.stringify(s.followups) + '\n' : '',
     houseRules(s),
     '',
     'Produce a highly detailed delivery plan and write it as JSON to the file `.vd-plan.json` at the root of your working directory. Do not modify, create or commit anything else: this checkout is read-only and any other change fails the run.',
@@ -369,12 +407,13 @@ async function reviewPlan(st, replanned) {
     '',
     inheritedNote(s, st.base, 'reviewer'),
     '',
+    s.followups && s.followups.length ? 'This scope also carries follow-ups from an earlier run; the plan must cover each one or say why not: ' + JSON.stringify(s.followups.map((f) => ({ package: f.package, kind: f.kind, branch: f.branch, summary: f.summary }))) + '\n' : '',
     houseRules(s),
     '',
     'Your review is the only ground-truthing before code is written: no agent re-checks a package\'s spec before vibe starts on it. Verify every premise of every spec against the code (files, symbols, line references, commands, test names) and correct what has drifted.',
     'Make opinionated decisions grounded in gold-standard practice, official documentation and authoritative sources: verify the cited sources and add better ones' + (s.profile.re_corpus ? ', and check the prior-art corpus where its rule applies' : '') + '. Fix wrong root-cause assumptions, missing edge cases, missing or non-discriminating tests, under-specified specs, `files` lists that are too narrow (the scope is enforced mechanically) or too wide, unsafe wave splits (same-wave packages must have disjoint files), missing depends_on (every package that needs another package\'s output, including a memo, an ADR or an RCA, must list it; it will not run until that package is integrated), and missing docs or bookkeeping. Flag and fix any package whose spec actually targets a different repository than ' + s.repo_path + ' (its repo_path must be ' + s.repo_path + '; cross-repo work is another scope, so drop it and say so in review_notes). Resolve user_decisions_needed yourself when best practice decides them; leave only true owner questions.',
     'Package kinds: any package that would recreate inherited work must become verify_only (or be dropped). A verify_only package needs test commands that fail when the verification fails; they run mechanically as gates.',
-    'Set high_risk: true on every package doing concurrency, security or data-integrity work (locking, leases, ordering, auth, secrets, crypto, persistence, migrations, hash chains). A high-risk package is adjudicated by a senior reviewer even when the first reviewer approves; a normal package that the first reviewer approves ships on that approval.',
+    'Set high_risk: true on every package doing concurrency, security or data-integrity work (locking, leases, ordering, auth, secrets, crypto, persistence, migrations, hash chains). Every package gets exactly one code review: a high-risk package gets it from the senior reviewer instead of the standard one. A package with no blocking finding ships on that review; small issues become recorded follow-ups.',
     'Verdict:',
     '- approve: the plan is good as written. Return it unchanged in `plan`.',
     '- correct: return the full corrected plan in `plan`, with review_notes saying what changed and why.',
@@ -448,15 +487,17 @@ for (const p of plans) {
 }
 
 // ---------------------------------------------------------------------------
-// Per package: vibe (thin wrapper) -> gates -> review [-> adjudicate] -> up to
-// MAX_FIX fix rounds, each straight back to vibe.
+// Per package: vibe (thin wrapper) -> gates -> one review. No blocking finding:
+// ship. Blocking findings: one fix round straight back to vibe with those items
+// only -> gates -> a narrow re-check of those items; anything still open is not
+// integrated and is filed as a follow-up.
 // ---------------------------------------------------------------------------
 
 // The vibe prompt for a package, built here from the reviewed plan; no agent
 // rewrites it. mode: initial | continue | fix; a continuation inside a fix
 // round carries both blocks.
 function packagePrompt(c) {
-  const { s, plan, base, pkg, wt, forkSha, mode, last, fixes, gates, round } = c
+  const { s, plan, base, pkg, wt, forkSha, mode, last, fixes, gates } = c
   const p = s.profile
   const verify = isVerify(pkg)
   const L = [
@@ -494,7 +535,7 @@ function packagePrompt(c) {
   // Additive with CONTINUATION: a fix round that ends mid-way keeps its fixes.
   if (fixes && fixes.length) {
     L.push('',
-      'FIX ROUND ' + round + '. Your branch was reviewed. Make exactly these required fixes, as new commits on top (never amend or rewrite the earlier ones):',
+      'FIX ROUND. Your branch was reviewed. Fix exactly these blocking findings, as new commits on top (never amend or rewrite the earlier ones). Nothing else: the reviewer\'s other findings are recorded as follow-ups and must not be addressed in this round.',
       ...(fixes || []).map((f, i) => (i + 1) + '. ' + f),
       'Gate results for the reviewed head: ' + gateSummary(gates) + '.',
       verify ? 'Write a fresh `' + VERIFY_NOTE + '` covering the fixes.' : 'The round is delivered only if it adds at least one new commit.')
@@ -511,12 +552,16 @@ async function deliverPackage(s, plan, setup, pkg, forkSha) {
   const wt = p.worktree_root + '/' + slug(pkg.branch)
   const lock = pkg.needs_vm && p.vm ? p.vm.lock : null
   const verify = isVerify(pkg)
-  const rec = { id: pkg.id, kind: pkg.kind, high_risk: !!pkg.high_risk, title: pkg.title, branch: pkg.branch, worktree: wt, fork_sha: forkSha, runs: [], rounds: [], final: null, reason: '', head: null, integrated: false, verification_note: null }
+  const rec = { id: pkg.id, kind: pkg.kind, high_risk: !!pkg.high_risk, title: pkg.title, branch: pkg.branch, worktree: wt, fork_sha: forkSha, runs: [], rounds: [], final: null, reason: '', head: null, integrated: false, verification_note: null, deferred: [], open_items: [] }
   let runNo = 0
   let gates = null
+  const packageGates = (round) => gatesRun({
+    label: 'gates:' + key + ':' + pkg.id + ':r' + round, phase: 'Review', wt, base: forkSha, out: pdir + '/gates-r' + round, level: 'package', profileJson: s.profile_json, allow: pkg.files,
+    verifyPaths: verify ? pkg.files : [], extraCmds: verify ? pkg.tests : [],
+  })
 
   // Up to MAX_RUNS vibe runs: the first in `mode`, the rest continuations.
-  async function drive(mode, fixes, since, round) {
+  async function drive(mode, fixes, since) {
     let last = null
     let m = mode
     for (let i = 0; i < MAX_RUNS; i++) {
@@ -526,7 +571,7 @@ async function deliverPackage(s, plan, setup, pkg, forkSha) {
       const setupSteps = ['Run `' + WTS + ' create --repo ' + q(s.repo_path) + ' --path ' + q(wt) + ' --branch ' + q(pkg.branch) + ' --from ' + forkSha + ' --reuse`. If it prints EXISTS, stop and return status "START_FAILED: " plus its output, raw "".']
       const res = await vibeRun({
         label: 'vibe:' + key + ':' + pkg.id + ':' + runNo, phase: 'Deliver', setup: setupSteps, wt, base: forkSha, since,
-        promptFile: out + '/prompt.md', promptText: packagePrompt({ s, plan, base: setup.base, pkg, wt, forkSha, mode: m, last, fixes, gates, round }),
+        promptFile: out + '/prompt.md', promptText: packagePrompt({ s, plan, base: setup.base, pkg, wt, forkSha, mode: m, last, fixes, gates }),
         out, allow: pkg.files, lock, expectCommits: verify ? 'any' : 'yes', expectFile: verify ? VERIFY_NOTE : '', blockedFile: BLOCKED_NOTE,
         guardRefs: G.guardRefs, mrCheckCmd: G.mrCheckCmd,
       })
@@ -549,97 +594,97 @@ async function deliverPackage(s, plan, setup, pkg, forkSha) {
     return { ok: false, why: 'not delivered after ' + MAX_RUNS + ' runs; last reasons ' + JSON.stringify((last && last.reasons) || []) }
   }
 
-  const d0 = await drive('initial', null, forkSha, 0)
+  const d0 = await drive('initial', null, forkSha)
   if (!d0.ok) {
     rec.final = d0.policy ? 'policy_violation' : d0.blocked ? 'blocked' : 'failed'
     rec.reason = d0.why
     return rec
   }
 
-  for (let round = 0; ; round++) {
-    gates = await gatesRun({
-      label: 'gates:' + key + ':' + pkg.id + ':r' + round, phase: 'Review', wt, base: forkSha, out: pdir + '/gates-r' + round, level: 'package', profileJson: s.profile_json, allow: pkg.files,
-      verifyPaths: verify ? pkg.files : [], extraCmds: verify ? pkg.tests : [],
-    })
-    // Mechanical facts first: approval always needs ok gates, and a verify-only
-    // package needs gates that actually ran (its tests are extra gates).
-    const gatesOk = !!(gates && gates.ok && (!verify || gates.ran > 0))
-    const gateFix = 'Gates are not ok: ' + gateSummary(gates) + '. Make every gate pass (failures listed in the profile as known master failures are acceptable).' + (verify && gates && !gates.ran ? ' No gate ran at all.' : '')
-    const rev = await agent([
-      'You are the REVIEWER for work package "' + pkg.id + '" (' + (verify ? 'verify_only' : 'change') + (pkg.high_risk ? ', HIGH RISK' : '') + ') of scope "' + key + '", round ' + round + '. vibe wrote the code on branch ' + pkg.branch + ' in worktree ' + wt + ', forked from ' + forkSha + '. Your verdict is final for a normal package: approve only if it is merge-ready.',
-      'PACKAGE (JSON): ' + JSON.stringify(pkg),
-      inheritedNote(s, setup.base, 'reviewer').split('\n')[0],
-      'Mechanical gate results (already run; do NOT re-run builds or tests): ' + gateSummary(gates) + '. Full gate log: ' + (gates ? gates.log : '(none)') + '; per-gate logs are listed in it.' + (verify ? ' Gates named extra-N are this package\'s own test commands.' : ''),
-      verify ? 'This is a verify_only package: zero commits is legitimate. vibe\'s verification note is at ' + (rec.verification_note || '(missing)') + '; judge whether it, the gate logs and the code actually establish every acceptance criterion.' : '',
-      houseRules(s),
-      'Review the actual diff (`git -C ' + q(wt) + ' diff ' + forkSha + '..HEAD` and `git log`), not any report. For every acceptance criterion say whether it is met and cite the evidence (diff hunk or gate log line). Check correctness, concurrency, security, error handling, whether new tests would fail without the change (reason from the code and the base version), docs and ADR consistency, and scope creep. Do not edit anything.',
-      'Verdict: approve (merge-ready), fix (put each required fix in required_fixes, concrete enough for a coder with no other context; drop nits not worth a round) or reject (wrong approach). fix and reject go to a senior adjudicator.',
-    ].filter(Boolean).join('\n'), { label: 'review:' + key + ':' + pkg.id + ':r' + round, phase: 'Review', model: 'sonnet', effort: 'high', schema: REVIEW })
+  // ---- the one review (Sonnet; Fable for a high-risk package) ----
+  gates = await packageGates(0)
+  const gatesOk = gatesPassed(gates, verify)
+  const reviewer = pkg.high_risk ? 'fable' : 'sonnet'
+  const rev = await agent([
+    'You are the REVIEWER for work package "' + pkg.id + '" (' + (verify ? 'verify_only' : 'change') + (pkg.high_risk ? ', HIGH RISK' : '') + ') of scope "' + key + '". vibe wrote the code on branch ' + pkg.branch + ' in worktree ' + wt + ', forked from ' + forkSha + '. This is the package\'s only review: nobody reviews it again, except for a narrow re-check of the blocking findings you list.',
+    'PACKAGE (JSON): ' + JSON.stringify(pkg),
+    inheritedNote(s, setup.base, 'reviewer').split('\n')[0],
+    'Mechanical gate results (already run; do NOT re-run builds or tests): ' + gateSummary(gates) + '. Full gate log: ' + (gates ? gates.log : '(none)') + '; per-gate logs are listed in it.' + (verify ? ' Gates named extra-N are this package\'s own test commands.' : ''),
+    verify ? 'This is a verify_only package: zero commits is legitimate. vibe\'s verification note is at ' + (rec.verification_note || '(missing)') + '; judge whether it, the gate logs and the code actually establish every acceptance criterion.' : '',
+    houseRules(s),
+    'Review the actual diff (`git -C ' + q(wt) + ' diff ' + forkSha + '..HEAD` and `git log`), not any report. For every acceptance criterion say whether it is met and cite the evidence (diff hunk or gate log line). Check correctness, concurrency, security, error handling, whether new tests would fail without the change (reason from the code and the base version), docs and ADR consistency, and scope creep. Do not edit anything.',
+    'Classify EVERY finding:',
+    '- blocking: a correctness, concurrency or data-integrity bug; a security problem; a false or fabricated claim in code comments, docs, commit messages or bookkeeping (for example "proof X ran" when it did not, or a test said to cover a case it does not); an acceptance criterion not met in a way that leaves the delivered behaviour wrong or a claim false.',
+    '- deferrable: everything else: wording, line-number citations, style, naming, missing polish, extra tests that would be nice, follow-on improvements.',
+    'How your findings are used: work ships as soon as it has no blocking finding (deferrable findings are recorded as follow-ups in the repository\'s bookkeeping and the MR description, not fixed now). If there are blocking findings, vibe gets exactly those, once, and a short re-check verifies only them. So an unmet acceptance criterion must also appear as a finding with its severity, not only in `acceptance`, and every blocking finding needs a required_fix concrete enough for a coder with no other context. Do not inflate severity to get polish done, and do not downgrade a real bug to keep work moving.',
+    'Verdict: ship (no blocking finding), fix (at least one blocking finding) or reject (the approach itself is wrong, so fixing findings cannot save it; say why in reject_reason).',
+  ].filter(Boolean).join('\n'), { label: 'review:' + key + ':' + pkg.id + ':r0', phase: 'Review', model: reviewer, effort: 'high', schema: REVIEW })
 
-    let verdict, fixes, rationale, adjudicated = false
-    if (rev && rev.verdict === 'approve' && !pkg.high_risk) {
-      // A normal package's approval is final; failing gates turn it into a fix round, mechanically.
-      verdict = gatesOk ? 'approve' : 'fix'
-      fixes = gatesOk ? [] : [gateFix]
-      rationale = 'reviewer approved' + (gatesOk ? '' : ', but gates are not ok')
-    } else {
-      adjudicated = true
-      const adj = await agent([
-        'You are the senior ADJUDICATOR for work package "' + pkg.id + '" (scope "' + key + '"), branch ' + pkg.branch + ' in ' + wt + ', forked from ' + forkSha + '. Round ' + round + ' of at most ' + (MAX_FIX + 1) + '. You are here because ' + (!rev ? 'the reviewer returned nothing' : rev.verdict !== 'approve' ? 'the reviewer said ' + rev.verdict : 'the package is high risk') + '.',
-        'PACKAGE: ' + JSON.stringify(pkg),
-        'REVIEW: ' + JSON.stringify(rev),
-        'GATES: ' + gateSummary(gates),
-        verify ? 'verify_only package; vibe\'s verification note: ' + (rec.verification_note || '(missing)') : '',
-        'Read the diff yourself. Decide: approve (merge-ready; requires gates ok), fix (list the exact required fixes, concrete enough for a coder with no context; drop nits not worth a round), or reject (wrong approach). Ground disputed points in official docs or best practice.',
-      ].filter(Boolean).join('\n'), { label: 'adjudicate:' + key + ':' + pkg.id + ':r' + round, phase: 'Review', model: 'fable', effort: 'high', schema: ADJ })
-      if (adj) {
-        verdict = adj.verdict
-        fixes = adj.required_fixes.slice()
-        rationale = adj.rationale
-      } else if (rev && rev.verdict !== 'approve') {
-        verdict = rev.verdict
-        fixes = (rev.required_fixes || []).length ? rev.required_fixes.slice() : (rev.findings || []).map((f) => f.issue + ' -> ' + f.fix)
-        rationale = 'adjudicator died; reviewer verdict used'
-      } else if (rev) {
-        // High-risk approval without its adjudication: not enough to ship.
-        verdict = 'fix'
-        fixes = ['Senior adjudication of this high-risk package did not complete; re-check concurrency, security and data-integrity aspects and add tests for them.']
-        rationale = 'adjudicator died on a high-risk package'
-      } else {
-        verdict = 'reject'
-        fixes = []
-        rationale = 'reviewer and adjudicator both died'
-      }
-      if (verdict === 'approve' && !gatesOk) {
-        verdict = 'fix'
-        fixes.push(gateFix)
-      }
-    }
-    rec.rounds.push({ round, gates: gateSummary(gates), review: rev ? rev.verdict : null, adjudicated, verdict, fixes, rationale })
-    if (verdict === 'approve') {
-      rec.final = 'approved'
-      rec.head = gates.head
-      return rec
-    }
-    if (verdict === 'reject') {
-      rec.final = 'rejected'
-      rec.reason = rationale
-      return rec
-    }
-    if (round >= MAX_FIX) {
-      rec.final = 'unapproved'
-      rec.reason = 'still needs fixes after ' + MAX_FIX + ' fix rounds: ' + JSON.stringify(fixes)
-      return rec
-    }
-    log(key + ':' + pkg.id + ': fix round ' + (round + 1) + ': ' + fixes.length + ' required fix(es)')
-    // A fix round must add commits beyond the head that was reviewed (change packages).
-    const d = await drive('fix', fixes, gates && isSha(gates.head) ? gates.head : forkSha, round + 1)
-    if (!d.ok) {
-      rec.final = d.policy ? 'policy_violation' : d.blocked ? 'blocked' : 'failed'
-      rec.reason = 'fix round ' + (round + 1) + ': ' + d.why
-      return rec
-    }
+  if (!rev) {
+    // Never ship on silence, and never invent a fix list for one.
+    rec.rounds.push({ round: 0, gates: gateSummary(gates), reviewer, review: null })
+    rec.final = 'review_failed'
+    rec.reason = 'the ' + reviewer + ' reviewer returned nothing; not shipped without a review'
+    return rec
   }
+  const findings = (rev.findings || []).filter((f) => f && typeof f.summary === 'string')
+  const blocking = findings.filter((f) => f.severity === 'blocking')
+  rec.deferred = findings.filter((f) => f.severity !== 'blocking')
+  if (!gatesOk) blocking.push(gateFinding(gates, verify))
+  rec.rounds.push({ round: 0, gates: gateSummary(gates), reviewer, review: rev.verdict, blocking: blocking.length, deferrable: rec.deferred.length })
+
+  if (rev.verdict === 'reject') {
+    rec.final = 'rejected'
+    rec.reason = 'reviewer rejected the approach: ' + (rev.reject_reason || '(no reason given)')
+    rec.open_items = blocking
+    return rec
+  }
+  if (!blocking.length) {
+    rec.final = 'approved'
+    rec.head = gates.head
+    return rec
+  }
+
+  // ---- one vibe fix round with the blocking items only, gates, narrow re-check ----
+  const reviewedHead = gates && isSha(gates.head) ? gates.head : forkSha
+  log(key + ':' + pkg.id + ': fix round: ' + blocking.length + ' blocking finding(s); ' + rec.deferred.length + ' deferrable recorded as follow-ups')
+  const d = await drive('fix', blocking.map(fixText), reviewedHead)
+  if (!d.ok) {
+    rec.final = d.policy ? 'policy_violation' : d.blocked ? 'blocked' : 'failed'
+    rec.reason = 'fix round: ' + d.why
+    rec.open_items = blocking
+    return rec
+  }
+  gates = await packageGates(1)
+  const fixedOk = gatesPassed(gates, verify)
+  const reviewed = blocking.filter((f) => !f.from_gates)
+  const open = []
+  let rc = null
+  if (reviewed.length) {
+    rc = await agent([
+      'You are the RE-CHECKER for work package "' + pkg.id + '" of scope "' + key + '" (branch ' + pkg.branch + ', worktree ' + wt + '). Its reviewer listed the blocking findings below; vibe then made one fix round. Check ONLY these items. This is not a review: do not look for anything else, and do not re-run builds or tests.',
+      'BLOCKING ITEMS:',
+      ...reviewed.map((f, i) => (i + 1) + '. ' + fixText(f)),
+      'The fix round\'s diff: `git -C ' + q(wt) + ' diff ' + reviewedHead + '..HEAD` (the head the reviewer saw was ' + reviewedHead + '). Gate results after the fix (already run): ' + gateSummary(gates) + '.' + (verify ? ' Verification note: ' + (rec.verification_note || '(missing)') + '.' : ''),
+      'For each item return its number, resolved (true only if the current code, not a report or a commit message, fixes it as required) and the evidence (a diff hunk, a file:line or a gate log line).',
+    ].join('\n'), { label: 'recheck:' + key + ':' + pkg.id + ':r1', phase: 'Review', model: 'sonnet', effort: 'medium', schema: RECHECK })
+    reviewed.forEach((f, i) => {
+      const it = rc && Array.isArray(rc.items) ? rc.items.find((x) => x && x.index === i + 1) : null
+      if (!(it && it.resolved === true)) open.push(Object.assign({}, f, { evidence: it ? it.evidence : rc ? 'the re-check did not report this item' : 'the re-check returned nothing' }))
+    })
+  }
+  if (!fixedOk) open.push(gateFinding(gates, verify))
+  rec.rounds.push({ round: 1, gates: gateSummary(gates), recheck: rc ? rc.items : reviewed.length ? null : 'not needed (gate items only)', open: open.length })
+  if (open.length) {
+    rec.final = 'blocking_open'
+    rec.reason = open.length + ' blocking item(s) still open after the fix round: ' + open.map((f) => f.summary).join(' | ')
+    rec.open_items = open
+    rec.head = gates && isSha(gates.head) ? gates.head : null
+    return rec
+  }
+  rec.final = 'approved'
+  rec.head = gates.head
+  return rec
 }
 
 // ---------------------------------------------------------------------------
@@ -661,11 +706,30 @@ async function integrate(s, setup, rec) {
     return true
   }
 
-  const m = await agent([
-    'Merge approved work package "' + rec.id + '" (branch ' + rec.branch + ', head ' + rec.head + ') into the integration branch ' + setup.integration_branch + ' in worktree ' + setup.integration_worktree + ' (repo ' + s.repo_path + ').',
-    houseRules(s),
-    'Steps: (1) record pre_merge_sha = `git -C <worktree> rev-parse HEAD`; the tree must be clean. (2) `git -C <worktree> merge --no-ff ' + rec.branch + '`. (3) On conflicts, resolve them preserving both sides\' intent and complete the merge; set conflicts=true and explain each resolution in notes. If you cannot resolve them safely, `git merge --abort` and return merged=false. (4) Do NOT push and do not run test suites (gates run next, mechanically). Return merged, pre_merge_sha, head (full sha after the merge), conflicts, notes.',
-  ].join('\n'), { label: 'integrate:' + key + ':' + rec.id, phase: 'Integrate', model: 'sonnet', schema: INTEG })
+  // integrator "script": a mechanical merge; Sonnet only when it conflicts.
+  let m = null
+  let conflictNote = ''
+  if (INTEGRATOR === 'script') {
+    const r = await scriptRun('merge:' + key + ':' + rec.id, 'Integrate', ['Run `' + SB + ' merge --wt ' + wtq + ' --branch ' + q(rec.branch) + ' --pkg-head ' + rec.head + ' --fork ' + rec.fork_sha + ' --expect-head ' + setup.head + '`.'])
+    if (r.ok && r.merged && isSha(r.head) && isSha(r.pre_merge_sha)) {
+      m = { merged: true, pre_merge_sha: r.pre_merge_sha, head: r.head, conflicts: false, notes: 'merged by scope-branch.sh merge' + (r.tree_equal ? '; tree equals the gated package tree' : '') }
+    } else if (r.conflicts) {
+      conflictNote = ' The mechanical merge conflicted in ' + JSON.stringify(r.files || []) + ' and was aborted; HEAD is back at ' + r.pre_merge_sha + '.'
+      log(key + ':' + rec.id + ': mechanical merge conflicts; handing it to the Sonnet integrator')
+    } else {
+      rec.final = 'integration_failed'
+      rec.reason = 'integration (script): ' + (r.reason || 'no result')
+      rec.integration = { ok: false, reason: rec.reason }
+      return false
+    }
+  }
+  if (!m) {
+    m = await agent([
+      'Merge the shipped work package "' + rec.id + '" (branch ' + rec.branch + ', head ' + rec.head + ') into the integration branch ' + setup.integration_branch + ' in worktree ' + setup.integration_worktree + ' (repo ' + s.repo_path + ').' + conflictNote,
+      houseRules(s),
+      'Steps: (1) record pre_merge_sha = `git -C <worktree> rev-parse HEAD`; the tree must be clean. (2) `git -C <worktree> merge --no-ff ' + rec.branch + '`. (3) On conflicts, resolve them preserving both sides\' intent and complete the merge; set conflicts=true and explain each resolution in notes. If you cannot resolve them safely, `git merge --abort` and return merged=false. (4) Do NOT push and do not run test suites (gates run next, mechanically). Return merged, pre_merge_sha, head (full sha after the merge), conflicts, notes.',
+    ].join('\n'), { label: 'integrate:' + key + ':' + rec.id, phase: 'Integrate', model: 'sonnet', schema: INTEG })
+  }
   if (!m || !m.merged || !isSha(m.head) || !isSha(m.pre_merge_sha)) {
     rec.final = 'integration_failed'
     rec.reason = 'integration: ' + (m ? m.notes : 'integrator died')
@@ -719,7 +783,38 @@ async function integrate(s, setup, rec) {
 // ---------------------------------------------------------------------------
 // Per scope: [refresh] -> setup -> waves -> integrate -> MR prep -> MR merge
 // ---------------------------------------------------------------------------
-function mrPrompt(s, plan, setup, integrated, notIntegrated, fixOf) {
+// ---------------------------------------------------------------------------
+// Follow-ups: every deferrable finding of a reviewed package and every package
+// that was not integrated (with its open items, branch and evidence). They are
+// returned as structured data (input for a next run), written by MR prep into
+// the profile's bookkeeping.followup_file, and listed in the MR description.
+// Each line carries a tag [vd:<scope>/<package>] the merge stage greps for.
+// ---------------------------------------------------------------------------
+const FOLLOWUP_HEADING = '## Deferred / follow-ups'
+const followupTag = (scope, id) => 'vd:' + scope + '/' + id
+function packageFollowups(s, r) {
+  const base = { scope: s.key, repo: s.repo_path, integration_branch: s.integration_branch, package: r.id, title: r.title || '', branch: r.branch || '', final: r.final, date: A.today, run_tag: A.run_tag }
+  const where = 'run dir ' + RUN + '/' + s.key + '/' + r.id + (r.worktree ? '; worktree ' + r.worktree : '') + (r.head ? '; head ' + r.head : '')
+  const out = []
+  const add = (kind, f, evidence) => out.push(Object.assign({}, base, { kind, severity: f.severity || '', summary: f.summary, file: f.file || '', line: f.line || '', required_fix: f.required_fix || '', evidence: evidence || '' }))
+  if (!r.integrated) {
+    const items = r.open_items || []
+    if (items.length) for (const f of items) add('not_integrated', f, (f.evidence ? f.evidence + '; ' : '') + where)
+    else add('not_integrated', { summary: r.final + ': ' + (r.reason || '(no reason recorded)') }, where)
+  }
+  for (const f of r.deferred || []) add('deferred', f, '')
+  return out
+}
+function followupLine(f) {
+  return '- [ ] ' + f.date + ' follow-up (' + (f.kind === 'deferred' ? 'deferred finding' : 'not integrated: ' + f.final) + ') from scope ' + f.scope + ', package ' + f.package + ', branch ' + (f.branch || '(none)') + ': ' + f.summary +
+    (f.file ? ' (' + f.file + (f.line ? ':' + f.line : '') + ')' : '') +
+    (f.required_fix ? '. Needed: ' + f.required_fix : '') +
+    (f.kind !== 'deferred' && f.evidence ? '. Evidence: ' + f.evidence : '') +
+    ' [' + followupTag(f.scope, f.package) + ']'
+}
+const followupBlock = (fus) => FOLLOWUP_HEADING + '\n\n' + (fus.length ? fus.map(followupLine).join('\n') : 'None.')
+
+function mrPrompt(s, plan, setup, integrated, notIntegrated, followups, fixOf) {
   const p = s.profile
   const L = [
     'You are preparing the merge request for scope "' + s.key + '" in your working directory, which is the integration worktree of branch ' + setup.integration_branch + '. Today is ' + A.today + '.',
@@ -735,13 +830,16 @@ function mrPrompt(s, plan, setup, integrated, notIntegrated, fixOf) {
   } else {
     L.push(
       'Integrated packages: ' + JSON.stringify(integrated.map((r) => ({ id: r.id, kind: r.kind, title: r.title, verification_note: r.verification_note || undefined }))),
-      'NOT integrated (they must stay open in the bookkeeping, with a dated note saying why): ' + JSON.stringify(notIntegrated.map((r) => ({ id: r.id, final: r.final, reason: r.reason }))),
+      'NOT integrated (their plan-of-record entries stay unticked; each is filed as a follow-up below): ' + JSON.stringify(notIntegrated.map((r) => ({ id: r.id, final: r.final, reason: r.reason }))),
       '',
       'Steps:',
       (p.remote ? '1. `git fetch ' + p.remote + '` then `git merge --no-edit ' + p.base_ref + '`.' : '1. `git merge --no-edit ' + p.base_ref + '`.') + ' Resolve conflicts preserving both sides\' intent; commit the merge. If you resolved conflicts in code, run the package-level gates on what you touched: `' + GT + ' run --profile ' + q(s.profile_json) + ' --wt . --base ' + q(p.base_ref) + ' --out ' + q(RUN + '/' + s.key + '/mr-prep/vibe-gates-N') + ' --level package` (N = 1, 2, ...: a new out dir each time). Do not run the full gates: they run once after you, mechanically.',
-      '2. Bookkeeping in ' + p.bookkeeping.files.join(', ') + ': tick the entries this scope completed, with completion notes (' + p.bookkeeping.convention + '). Stage only your own hunks. Commit.',
-      p.no_remote ? '3. This repo has no remote: do not push.' : '3. Push the integration branch, and only it: `git push -u ' + p.remote + ' ' + setup.integration_branch + '`.',
-      '4. Write the merge request description to ' + RUN + '/' + s.key + '/mr-prep/description.md (outside the repository): what changed, the packages (integrated, verified without changes, and not integrated), and anything not done. Leave a final "## Gates" heading empty: the mechanical full-gate results are appended after you. Every claim must be checkable against the diff; write nothing you have not verified. Starting point: ' + JSON.stringify(plan.mr_description),
+      '2. Bookkeeping in ' + p.bookkeeping.files.join(', ') + ': tick the entries this scope completed, with completion notes (' + p.bookkeeping.convention + '). Leave the entries of packages that were not integrated unticked. Stage only your own hunks. Commit.',
+      followups.length
+        ? '3. Follow-ups (mandatory: none may be left out). Add every line between BEGIN-FOLLOWUPS and END-FOLLOWUPS below to ' + p.bookkeeping.followup_file + ', where that file\'s convention puts new open items (' + p.bookkeeping.convention + '). You may adapt each line\'s form to the convention, but every entry must keep its date, scope, package, branch, finding and its trailing [vd:...] tag, which is checked mechanically. Stage only your own hunks. Commit.\nBEGIN-FOLLOWUPS\n' + followups.map(followupLine).join('\n') + '\nEND-FOLLOWUPS'
+        : '3. There are no follow-ups to file.',
+      p.no_remote ? '4. This repo has no remote: do not push.' : '4. Push the integration branch, and only it: `git push -u ' + p.remote + ' ' + setup.integration_branch + '`.',
+      '5. Write the merge request description to ' + RUN + '/' + s.key + '/mr-prep/description.md (outside the repository): what changed, the packages (integrated, verified without changes, and not integrated), and anything not done. Then a "' + FOLLOWUP_HEADING + '" section holding exactly the follow-up lines above (or "None."). Leave a final "## Gates" heading empty: the mechanical full-gate results are appended after you. Every claim must be checkable against the diff; write nothing you have not verified. Starting point: ' + JSON.stringify(plan.mr_description),
       'Do NOT open, approve or merge a merge request: a later stage does that after every check.'
     )
   }
@@ -828,7 +926,7 @@ async function runScope(pl) {
       }
       if (setup.broken) {
         r.final = 'blocked_integration'
-        r.reason = 'approved but not merged: ' + setup.broken
+        r.reason = 'shipped by review but not merged: ' + setup.broken
         continue
       }
       if (await integrate(s, setup, r)) {
@@ -844,32 +942,38 @@ async function runScope(pl) {
     for (const w of waves) for (const pkg of w.packages) if (!seen.has(pkg.id)) recs.push({ id: pkg.id, kind: pkg.kind, title: pkg.title, branch: pkg.branch, final: 'blocked_integration', reason: 'not run: ' + setup.broken, integrated: false })
     out.blockers.push('integration branch unusable: ' + setup.broken)
   }
-  out.packages = recs.map((r) => ({ id: r.id, kind: r.kind, high_risk: !!r.high_risk, final: r.final, reason: r.reason || '', integrated: !!r.integrated, branch: r.branch, worktree: r.worktree || null, verification_note: r.verification_note || null, runs: r.runs || [], rounds: r.rounds || [], integration: r.integration || null }))
+  out.packages = recs.map((r) => ({ id: r.id, kind: r.kind, high_risk: !!r.high_risk, final: r.final, reason: r.reason || '', integrated: !!r.integrated, branch: r.branch, worktree: r.worktree || null, verification_note: r.verification_note || null, deferred: r.deferred || [], open_items: r.open_items || [], runs: r.runs || [], rounds: r.rounds || [], integration: r.integration || null }))
   const integrated = recs.filter((r) => r.integrated)
   const notIntegrated = recs.filter((r) => !r.integrated)
   out.dropped = notIntegrated.map((r) => ({ id: r.id, final: r.final, reason: r.reason || '' }))
+  // Every deferred finding and every package not integrated, built before any stop.
+  const followups = [].concat(...recs.map((r) => packageFollowups(s, r)))
+  out.followups = followups
+  out.followups_recorded = null
+  const policyHits = recs.filter((r) => r.final === 'policy_violation')
+  if (policyHits.length) log(key + ': POLICY VIOLATION in ' + policyHits.map((r) => r.id + ' (' + r.reason + ')').join('; '))
   if (setup.broken) {
     out.status = 'needs_owner_decision'
     return out
   }
   if (!integrated.length) {
-    out.status = 'failed'
-    out.blockers.push('no package was integrated')
+    out.status = 'needs_owner_decision'
+    out.blockers.push('no package was integrated, so there is nothing to ship; every package is filed in followups')
     return out
   }
 
   // ---- MR PREP (vibe), then the full gates once, mechanically; one fix run if they fail ----
   const mdir = RUN + '/' + key + '/mr-prep'
-  const allowed = [].concat(...integrated.map((r) => (allPackages(plan).find((k) => k.id === r.id) || { files: [] }).files), p.bookkeeping.files, [p.bookkeeping.plan_entry_file])
+  const allowed = [].concat(...integrated.map((r) => (allPackages(plan).find((k) => k.id === r.id) || { files: [] }).files), p.bookkeeping.files, [p.bookkeeping.plan_entry_file, p.bookkeeping.followup_file])
   // The full gates diff the branch against the base ref: inherited work is allowed by file.
   const inheritedAllow = setup.base.inherited && setup.base.files_file ? setup.base.files_file : ''
   const G = guards(s)
-  let mr = await vibeRun({ label: 'mr-prep:' + key + ':1', phase: 'MR prep', wt: setup.integration_worktree, base: setup.head, promptFile: mdir + '/run1/prompt.md', promptText: mrPrompt(s, plan, setup, integrated, notIntegrated, null), out: mdir + '/run1', allow: ['*'], expectCommits: 'yes', guardRefs: G.guardRefs, mrCheckCmd: G.mrCheckCmd })
+  let mr = await vibeRun({ label: 'mr-prep:' + key + ':1', phase: 'MR prep', wt: setup.integration_worktree, base: setup.head, promptFile: mdir + '/run1/prompt.md', promptText: mrPrompt(s, plan, setup, integrated, notIntegrated, followups, null), out: mdir + '/run1', allow: ['*'], expectCommits: 'yes', guardRefs: G.guardRefs, mrCheckCmd: G.mrCheckCmd })
   let full = mr.delivered ? await gatesRun({ label: 'gates:' + key + ':full:1', phase: 'MR prep', wt: setup.integration_worktree, base: p.base_ref, out: mdir + '/gates-full-1', level: 'full', profileJson: s.profile_json, allow: allowed, allowFile: inheritedAllow }) : null
   const mrRuns = [mr]
   if (mr.delivered && full && !full.ok && !(mr.policy_violations || []).length) {
     log(key + ': full gates not ok after MR prep (' + gateSummary(full) + '); one vibe fix run')
-    const fix = await vibeRun({ label: 'mr-prep:' + key + ':2', phase: 'MR prep', wt: setup.integration_worktree, base: setup.head, since: mr.head, promptFile: mdir + '/run2/prompt.md', promptText: mrPrompt(s, plan, setup, integrated, notIntegrated, full), out: mdir + '/run2', allow: ['*'], expectCommits: 'yes', guardRefs: G.guardRefs, mrCheckCmd: G.mrCheckCmd })
+    const fix = await vibeRun({ label: 'mr-prep:' + key + ':2', phase: 'MR prep', wt: setup.integration_worktree, base: setup.head, since: mr.head, promptFile: mdir + '/run2/prompt.md', promptText: mrPrompt(s, plan, setup, integrated, notIntegrated, followups, full), out: mdir + '/run2', allow: ['*'], expectCommits: 'yes', guardRefs: G.guardRefs, mrCheckCmd: G.mrCheckCmd })
     mrRuns.push(fix)
     if (fix.delivered) {
       mr = fix
@@ -883,13 +987,14 @@ async function runScope(pl) {
 
   // ---- MR MERGE gate (mechanical); only this stage opens or merges an MR ----
   const B = out.blockers
-  const policyHits = recs.filter((r) => r.final === 'policy_violation').map((r) => r.id)
-  if (policyHits.length) B.push('policy violation in ' + policyHits.join(', ') + ' (an MR was opened or the default branch gained package commits outside this stage); the owner must review what happened before anything ships')
-  if (mrPolicy.length) B.push('MR prep policy violation: ' + mrPolicy.join('; '))
-  if (notIntegrated.length && SHIP_PARTIAL.indexOf(key) < 0) B.push('partial ship: ' + notIntegrated.map((r) => r.id + ' (' + r.final + ')').join(', ') + ' not integrated; the owner must allow a partial ship (ship_partial) or finish them')
-  if (!mr.delivered) B.push('MR prep did not deliver: ' + JSON.stringify(mr.reasons || []))
-  if (mrPolicyErr.length) B.push('MR prep policy check could not run: ' + mrPolicyErr.join('; '))
+  // Packages not integrated do not stop the merge: they are filed as follow-ups.
+  // The merge stops only on the conditions below.
+  if (policyHits.length) B.push('POLICY VIOLATION in ' + policyHits.map((r) => r.id + ' (' + r.reason + ')').join('; ') + '; the owner must review what happened before anything ships')
+  if (mrPolicy.length) B.push('POLICY VIOLATION in MR prep: ' + mrPolicy.join('; '))
+  if (mrPolicyErr.length) B.push('policy could not be verified for MR prep (the stage that pushes): ' + mrPolicyErr.join('; '))
+  if (!mr.delivered) B.push('MR prep did not deliver, so the full gates did not run: ' + JSON.stringify(mr.reasons || []))
   if (!full) B.push('full gates produced no result')
+  else if (full.out_of_scope && full.out_of_scope.length) B.push('POLICY VIOLATION: the integration branch changes files outside every shipped package, the bookkeeping and the inherited work: ' + full.out_of_scope.join(', ') + ' (' + gateSummary(full) + ')')
   else if (!full.ok) B.push('full gates not ok (beyond known master failures): ' + gateSummary(full))
   if (full && mr.head && full.head !== mr.head) B.push('gated head ' + full.head + ' differs from the head MR prep ended on (' + mr.head + ')')
   if (p.no_remote) B.push('the repo has no remote: branch ' + s.integration_branch + ' is ready at ' + (full ? full.head : '?') + ' in ' + setup.integration_worktree + ' for the owner to merge locally')
@@ -902,17 +1007,34 @@ async function runScope(pl) {
   }
   const openCmd = p.merge.open_command.replace(/\{source\}/g, q(s.integration_branch)).replace(/\{target\}/g, q(p.default_branch)).replace(/\{title\}/g, q(plan.mr_title)).replace(/\{description_file\}/g, q(mdir + '/description.md'))
   const mergeCmd = p.merge.command.replace(/\{sha\}/g, full.head)
+  // Follow-ups must be visible but never stop the merge: the check is reported, not gated.
+  const tags = [...new Set(followups.map((f) => followupTag(f.scope, f.package)))]
+  const fuCheck = tags.length ? 'for t in ' + tags.map(q).join(' ') + '; do git -C ' + q(setup.integration_worktree) + ' diff ' + setup.gates_base + ' ' + full.head + ' -- ' + q(p.bookkeeping.followup_file) + ' | grep \'^+\' | grep -qF -- "$t" || echo "MISSING $t"; done; echo FOLLOWUPS_CHECKED' : ''
   const merged = await agent([
     'You are the MR MERGE stage for scope "' + key + '": the only stage allowed to open and merge a merge request. Every gate has been checked mechanically; do not change code, bookkeeping or branches. Work from ' + setup.integration_worktree + '.',
     '1. `git ls-remote ' + q(p.remote) + ' refs/heads/' + s.integration_branch + '` must print ' + full.head + '. If not, stop: merged=false.',
     p.merge.mr_exists_command ? '2. `' + p.merge.mr_exists_command.replace(/\{branch\}/g, s.integration_branch) + '` must print 0 (no MR exists yet). If it prints anything else, stop: merged=false, and say which MR exists.' : '2. (no MR-existence check configured)',
-    '3. If ' + mdir + '/description.md is missing, write one from the plan (' + JSON.stringify(plan.mr_description) + '). Then make its "## Gates" section (add the heading if missing) say exactly: ' + JSON.stringify(gateSummary(full)) + ', and name each gate that hit only known ' + p.base_ref + ' failures.',
+    '3. If ' + mdir + '/description.md is missing, write one from the plan (' + JSON.stringify(plan.mr_description) + '). Make its "' + FOLLOWUP_HEADING + '" section (add it before "## Gates" if missing) hold exactly the text between BEGIN-FOLLOWUPS and END-FOLLOWUPS at the end of this message, replacing whatever that section held. Then make its "## Gates" section (add the heading if missing) say exactly: ' + JSON.stringify(gateSummary(full)) + ', and name each gate that hit only known ' + p.base_ref + ' failures.' +
+      (fuCheck ? ' Then run `' + fuCheck + '` and copy its whole output into followups_check (this only reports; whatever it prints, go on).' : ''),
     '4. Open the MR: `' + openCmd + '`. Note its number (iid) and URL.',
     '5. Merge it: `' + mergeCmd + '` with {iid} replaced by that number. ' + (p.merge.notes || ''),
     'The sha ' + full.head + ' is the gated head: never merge any other.',
-    '6. Confirm the MR shows as merged. Return merged, merge_commit, mr_url, notes.',
+    '6. Confirm the MR shows as merged. Return merged, merge_commit, mr_url, followups_check, notes.',
+    '',
+    'BEGIN-FOLLOWUPS',
+    followupBlock(followups).split('\n').slice(2).join('\n'),
+    'END-FOLLOWUPS',
   ].join('\n'), { label: 'mr-merge:' + key, phase: 'MR merge', model: 'sonnet', schema: MERGE })
   out.mr = merged || null
+  if (!tags.length) out.followups_recorded = true
+  else if (merged && typeof merged.followups_check === 'string' && /FOLLOWUPS_CHECKED/.test(merged.followups_check)) {
+    const missing = (merged.followups_check.match(/MISSING \S+/g) || []).map((x) => x.slice(8))
+    out.followups_recorded = !missing.length
+    if (missing.length) {
+      out.followups_missing = missing
+      log(key + ': follow-ups not found in ' + p.bookkeeping.followup_file + ': ' + missing.join(', ') + ' (file them by hand from the result)')
+    }
+  }
   out.status = merged && merged.merged ? 'merged' : 'needs_owner_decision'
   if (!(merged && merged.merged)) B.push('MR merge stage did not merge: ' + (merged ? merged.notes : 'agent died'))
   else out.cleanup = (out.cleanup || []).concat([setup.integration_worktree])
@@ -933,11 +1055,23 @@ for (const o of all) {
   if (o.status === 'plan_failed' && o.integration_worktree) worktrees.push({ path: o.integration_worktree, why: 'integration branch created before planning; the scope never ran (remove, and delete the local branch if unwanted)' })
   for (const pk of o.packages || []) if (!pk.integrated && pk.worktree) worktrees.push({ path: pk.worktree, why: 'package ' + pk.id + ' ' + pk.final + ': inspect, then remove' })
 }
+// Structured follow-ups for the whole run: a next run takes them as input
+// (a scope request's `followups`). A scope that stopped before its packages ran
+// is one entry of its own.
+const followups = []
+for (const o of all) {
+  if (o.followups) followups.push(...o.followups)
+  else if (o.status !== 'merged') {
+    const sc = A.scopes.find((x) => x.key === o.scope) || {}
+    followups.push({ scope: o.scope, repo: sc.repo_path || '', integration_branch: sc.integration_branch || '', package: '', title: '', branch: sc.integration_branch || '', final: o.status, kind: 'scope_not_delivered', severity: '', summary: (o.blockers || []).join(' | ') || o.status, file: '', line: '', required_fix: '', evidence: RUN + '/' + o.scope, date: A.today, run_tag: A.run_tag })
+  }
+}
 return {
   run_tag: A.run_tag,
   rundir: RUN,
-  summary: all.map((o) => o.scope + ': ' + o.status + (o.dropped && o.dropped.length ? ' (dropped: ' + o.dropped.map((d) => d.id + '=' + d.final).join(', ') + ')' : '')),
+  summary: all.map((o) => o.scope + ': ' + o.status + (o.dropped && o.dropped.length ? ' (not integrated: ' + o.dropped.map((d) => d.id + '=' + d.final).join(', ') + ')' : '') + (o.followups && o.followups.length ? ' (' + o.followups.length + ' follow-up(s)' + (o.followups_recorded === false ? ', NOT all recorded in the bookkeeping' : '') + ')' : '')),
   scopes: all,
+  followups,
   collision,
   worktrees_to_clean: worktrees,
 }

@@ -1,13 +1,13 @@
 ---
 name: vibe-delivery
-description: Multi-scope code delivery where the `vibe` CLI plans and writes the code in git worktrees and Claude agents review, adjudicate, integrate and merge, with delivery and gate results decided by scripts rather than by agent reports. Use when the user asks to deliver one or more scopes (bug fixes, features, close-outs) with vibe, runs /vibe-delivery, or asks for a "vibe delivery" or "vibe workflow". Needs a per-repo profile at .claude/vibe-delivery.yaml.
+description: Multi-scope code delivery where the `vibe` CLI plans, writes and fixes the code in git worktrees, Claude agents review each package once and merge, small issues ship as recorded follow-ups instead of extra rounds, and delivery and gate results are decided by scripts rather than by agent reports. Use when the user asks to deliver one or more scopes (bug fixes, features, close-outs) with vibe, runs /vibe-delivery, or asks for a "vibe delivery" or "vibe workflow". Needs a per-repo profile at .claude/vibe-delivery.yaml.
 ---
 
 # vibe-delivery
 
 Deliver several scopes in parallel. `vibe` writes plans and code; Claude agents check them; small scripts decide the facts that agents used to report (what the integration branch already holds, did vibe commit, did it stay in scope, did the gates pass, did anyone open an MR early). Everything specific to a repository, its hosts and its forge lives in that repo's profile, `.claude/vibe-delivery.yaml`. This skill holds none of it.
 
-Claude work is kept from doubling vibe's: no Claude agent drives or re-plans a package once the plan is reviewed, one reviewer reads each round, and the senior reviewer is called only when that reviewer disputes the work or the plan marked the package high-risk.
+vibe does the heavy lifting; Claude work is kept from doubling it. No Claude agent drives or re-plans a package once the plan is reviewed. Each package is reviewed once (Sonnet; Fable instead for a package the plan marked high-risk). The reviewer classifies every finding as blocking or deferrable. Packages ship first and get corrected afterwards: a package with no blocking finding ships at once and its deferrable findings become follow-ups in the repo's bookkeeping. Blocking findings get one vibe fix round and a narrow re-check of just those items. A package whose blocking items stay open is filed as a follow-up with its branch and evidence, and the rest of the scope still ships.
 
 Skill dir: `~/.claude/skills/vibe-delivery/` (written `$SK` below).
 
@@ -20,38 +20,51 @@ Skill dir: `~/.claude/skills/vibe-delivery/` (written `$SK` below).
 | Planner | vibe through a Haiku wrapper | writes `.vd-plan.json` in a read-only worktree at the integration head; `check-plan.sh` validates it |
 | Plan review | Fable | the only ground-truthing of package specs: approve, correct, or one re-plan; sets `kind` and `high_risk` |
 | Collision check | Fable | only with more than one scope |
-| Code | vibe through a Haiku wrapper | the wrapper creates the package worktree and runs `vibe-run.sh` with a prompt the workflow builds from the reviewed plan; no Claude agent writes or checks it |
+| Code and fixes | vibe through a Haiku wrapper | the wrapper creates the package worktree and runs `vibe-run.sh` with a prompt the workflow builds from the reviewed plan (or, for the fix round, from the blocking findings only); no Claude agent writes or checks it |
 | Gates | Haiku wrapper | `gates.sh` |
-| Reviewer | Sonnet | one per round; reads the diff, the gate log and, for verify-only packages, the verification note; never re-runs builds. Its approval is final for a normal package |
-| Adjudicator | Fable | only when the reviewer says fix or reject, or the package is `high_risk` |
-| Integrator | Sonnet | serial `merge --no-ff` into the integration branch; gates after the merge unless the merge tree provably equals the gated package tree; merge undone if they fail |
-| MR prep | vibe through the Haiku wrapper | merges the default branch, ticks bookkeeping (own hunks only), pushes the integration branch; never opens an MR. One more vibe run only if the full gates then fail |
-| MR merge | Sonnet | the only stage that opens and merges an MR, and only after the mechanical merge gate |
+| Reviewer | Sonnet (Fable for `high_risk`) | the package's one review: reads the diff, the gate log and, for verify-only packages, the verification note; never re-runs builds. Classifies each finding blocking or deferrable; verdict ship, fix or reject |
+| Re-check | Sonnet | only after a fix round: checks only the blocking items against the fix diff and the new gate log; no new review |
+| Integrator | Sonnet (default) or script | serial `merge --no-ff` into the integration branch. With `"integrator": "script"`, `scope-branch.sh merge` merges mechanically and Sonnet runs only on a conflict. Gates after the merge unless the merge tree provably equals the gated package tree; merge undone if they fail |
+| MR prep | vibe through the Haiku wrapper | merges the default branch, ticks bookkeeping (own hunks only), files every follow-up in the profile's `followup_file`, pushes the integration branch; never opens an MR. One more vibe run only if the full gates then fail |
+| MR merge | Sonnet | the only stage that opens and merges an MR, after the mechanical merge gate; always ships what was integrated |
 
 ## Stages
 
-BASE (`scope-branch.sh create`: the integration branch from `build_on_branch` or the base ref, the base ref merged in, inherited commits listed) -> PLAN (vibe, read-only worktree detached at the integration head) -> PLAN REVIEW (Fable) -> COLLISION (Fable, `must_finish_before`) -> [REFRESH: a scope that waited for another merges the base ref again] -> SETUP (`scope-branch.sh record`: plan-of-record entry, push) -> WAVES (packages of a wave in parallel, all forked from the same integration head; a wave starts only after the previous wave is integrated) -> INTEGRATE (Sonnet) -> MR PREP (vibe, then the full gates once) -> MR MERGE (Sonnet).
+BASE (`scope-branch.sh create`: the integration branch from `build_on_branch` or the base ref, the base ref merged in, inherited commits listed) -> PLAN (vibe, read-only worktree detached at the integration head) -> PLAN REVIEW (Fable) -> COLLISION (Fable, `must_finish_before`) -> [REFRESH: a scope that waited for another merges the base ref again] -> SETUP (`scope-branch.sh record`: plan-of-record entry, push) -> WAVES (packages of a wave in parallel, all forked from the same integration head; a wave starts only after the previous wave is integrated) -> INTEGRATE (Sonnet, or a script with Sonnet on conflict) -> MR PREP (vibe, then the full gates once) -> MR MERGE (Sonnet).
 
 Inherited files never count as out of scope: package runs diff against their fork (which holds them), and the full gates at MR prep, which diff the whole branch against the base ref, get the inherited file list as `--allow-file`. With `--remote`, the build-on branch is taken from the remote, not the local checkout.
 
 The branch exists before planning so that the planner and the plan reviewer read the exact tree every package forks from, and are told, from git, which commits it already holds (each with its files). They plan verification and bookkeeping around that work, never a package that recreates it. (The first live trial planned "re-apply commit X" for work SETUP had already merged; the package had nothing to commit.) The alternative, a precomputed summary of what the build-on branch adds, would leave the planner reading a tree without that work.
 
-Per package: vibe (up to `max_vibe_runs` runs: the first, then generic continuations) -> gates -> review -> [adjudicate] -> up to `max_fix_rounds` (default 2) fix rounds, each straight back to vibe with the required fixes. Package kinds:
+Per package: vibe (up to `max_vibe_runs` runs: the first, then generic continuations) -> gates -> the one review, then by severity:
+
+- **no blocking finding**: ship (integrate) at once; deferrable findings become follow-ups. No fix round.
+- **blocking findings** (or gates red beyond the known master failures, which the workflow adds as a blocking item itself): one fix round straight to vibe whose prompt holds the blocking items only -> gates -> one narrow Sonnet re-check of those items against the fix diff. All resolved and gates ok: ship. Anything open: `blocking_open`, not integrated, filed as a follow-up with its branch, evidence and open items; the rest of the scope still ships.
+- **reject** (the approach is wrong): `rejected`, filed with the reviewer's reason.
+- **no review** (the reviewer died): `review_failed`, filed; never shipped on silence.
+
+Blocking means a correctness, concurrency or data-integrity bug, a security problem, a false or fabricated claim in code comments, docs or bookkeeping ("proof X ran" when it did not), or red gates. Everything else (wording, line-number citations, style, polish, follow-on improvements) is deferrable.
+
+Package kinds:
 
 - `change` (default): delivered only with new commits.
 - `verify_only`: the work is already on the branch (inherited) or needs no change. It may end with zero commits; it is delivered by a verification note vibe writes (`.vd-verify.md`, collected into the run dir) and approved only if its gates pass, where its own `tests` run as extra gates and its `files` count as touched, so the gates cannot pass on nothing. A zero-commit verify-only package is integrated without a merge.
 
-Review: an approval from the reviewer is final for a normal package (gates must still be ok, mechanically; if not, the gate failures become the fix list without the adjudicator). Fable adjudicates only on fix or reject, or when the plan marked the package `high_risk: true` (plan review sets it for concurrency, security or data-integrity work).
+Review: the outcome is the workflow's, from the findings and the gates: the verdict only matters for reject. A high-risk package (`high_risk: true`, set by plan review for concurrency, security or data-integrity work) is reviewed by Fable instead of Sonnet, so it still gets exactly one review. There is no adjudication.
 
-Final states: `integrated`, `failed`, `blocked` (vibe reported the spec's premise false; no continuation), `rejected`, `unapproved`, `policy_violation`, `blocked_dependency` (a `depends_on` package was not integrated, so it never ran), `integration_failed`, `integration_gates_failed` (the merge was undone), `blocked_integration` (undoing a failed merge did not work, so the integration branch is unusable and the scope stops for the owner). Every package that is not `integrated` is listed in the result's `dropped`; none is dropped silently. A scope whose base merge conflicts ends `plan_failed` before planning.
+Final states: `integrated`, `failed`, `blocked` (vibe reported the spec's premise false; no continuation), `rejected`, `blocking_open`, `review_failed`, `policy_violation`, `blocked_dependency` (a `depends_on` package was not integrated, so it never ran), `integration_failed`, `integration_gates_failed` (the merge was undone), `blocked_integration` (undoing a failed merge did not work, so the integration branch is unusable and the scope stops for the owner). Every package that is not `integrated` is listed in the result's `dropped` and filed in `followups`; none is dropped silently. A scope whose base merge conflicts ends `plan_failed` before planning.
 
-MR MERGE stops with `needs_owner_decision`, and opens no MR, when any of these holds:
+Follow-ups are mandatory and visible: every deferrable finding and every package that was not integrated becomes one dated line naming the scope, package, branch and finding, tagged `[vd:<scope>/<package>]`. MR prep writes them into the profile's `bookkeeping.followup_file` and the MR description's "Deferred / follow-ups" section. The MR merge stage makes sure that section holds them and greps the branch for every tag (`followups_recorded`; a missing one is reported, never a stop). The result returns them as structured `followups[]`.
 
-- a package is not integrated and the scope is not in `ship_partial` (a partial ship);
-- a package hit a policy violation;
-- MR prep did not deliver, or the full gates are not ok apart from the profile's `known_master_failures`;
+MR MERGE always ships what was integrated. It stops with `needs_owner_decision`, and opens no MR, only when one of these holds:
+
+- a policy violation in the scope: a package or MR prep pushed to the default branch or opened an MR, or the integration branch holds files outside every shipped package, the bookkeeping and the inherited work (full gates' `out_of_scope`); also when MR prep's policy check could not run, since MR prep is the stage that pushes;
+- the full gates are not ok apart from the profile's `known_master_failures` (or did not run because MR prep did not deliver);
 - the gated head differs from the head MR prep ended on;
-- the profile has no remote, or lacks `merge.open_command`/`merge.command`.
+- the profile has no remote, or lacks `merge.open_command`/`merge.command`;
+- no package was integrated (nothing to ship; everything is in `followups`).
+
+The scope also stops before MR prep when the integration branch is unusable (`blocked_integration`).
 
 ## Mechanical checks (why they exist)
 
@@ -64,7 +77,7 @@ MR MERGE stops with `needs_owner_decision`, and opens no MR, when any of these h
 - **Environment**: vibe leaks its bundled `LD_LIBRARY_PATH`, which breaks the system `nix`. `vibe-run.sh` starts vibe under `env -u LD_LIBRARY_PATH` with a `nix` shim first on PATH, stdin from `/dev/null` (vibe `-p` hangs on an open stdin), and fresh `GOCACHE`/`GOLANGCI_LINT_CACHE`/`TMPDIR` under the run dir, deleted afterwards. Prompts also forbid text-only turns, which end a `-p` session.
 - **Shared resources**: packages with `needs_vm` hold an exclusive flock (`~/.cache/vibe-delivery/locks/<vm.lock>.lock`) for their whole vibe run, which serializes VM use across scopes, repos and sessions. Worktree paths are unique (`wt.sh` refuses collisions). Shared bookkeeping files are staged hunk by hunk.
 - **Plans**: `check-plan.sh` rejects duplicate ids, `depends_on` that is not in an earlier wave, overlapping same-wave file scopes, file scopes outside the repo, packages whose `repo_path` is not the scope's repo, verify-only packages without test commands, and (with `--inherited`) change packages whose spec asks to cherry-pick, re-apply or recreate an inherited commit.
-- **Verification is not repeated**: the plan review is the only ground-truthing of specs; the gates are the only builds (the reviewer reads their logs); integration skips the gate re-run only when `HEAD^1` is the package's fork and the merge tree equals the gated package tree, both checked with git; MR prep does not run the full gates itself, the workflow runs them once.
+- **Verification is not repeated**: the plan review is the only ground-truthing of specs; each package is reviewed once, and a fix round gets a re-check of its blocking items only, not a second review; the gates are the only builds (reviewer and re-checker read their logs); integration skips the gate re-run only when `HEAD^1` is the package's fork and the merge tree equals the gated package tree, both checked with git (`scope-branch.sh merge` reports this as `tree_equal`); MR prep does not run the full gates itself, the workflow runs them once.
 
 ## 1. Pre-flight
 
@@ -81,21 +94,20 @@ Run these before launching. Stop and tell the owner when one fails.
 
 ## 2. From request to launch
 
-Agree with the owner, per scope: a short key, the repo, a brief (what "done" means, constraints, links to backlog entries), an integration branch name (`<type>/<slug>`), and optionally an existing branch to build on. Ask whether any scope may ship partially (`ship_partial`, default none). Then write a request file in the session's job dir (not /tmp):
+Agree with the owner, per scope: a short key, the repo, a brief (what "done" means, constraints, links to backlog entries), an integration branch name (`<type>/<slug>`), and optionally an existing branch to build on. Every scope ships what was integrated; there is no partial-ship question. Then write a request file in the session's job dir (not /tmp):
 
 ```json
 {
   "run_tag": "2026-10-04a",
   "today": "2026-10-04",
   "jobdir": "/path/to/the/session/job/dir",
-  "ship_partial": [],
   "scopes": [
     { "key": "short-slug", "repo_path": "/abs/path/to/repo", "brief": "...", "integration_branch": "fix/short-slug" }
   ]
 }
 ```
 
-Optional per scope: `build_on_branch`, `profile_path` (a profile that is not on the checked-out branch yet). Optional top level: `max_fix_rounds` (2), `max_vibe_runs` (3), `max_turns` (150).
+Optional per scope: `build_on_branch`, `profile_path` (a profile that is not on the checked-out branch yet), `followups` (entries from an earlier run's result, see Post-run). Optional top level: `max_vibe_runs` (3: continuation runs when a vibe run ends undelivered), `max_turns` (150), `integrator` (`"sonnet"`, the default, or `"script"`: a mechanical `merge --no-ff` with Sonnet only on a conflict). `ship_partial` and `max_fix_rounds` are gone (`prepare-args.sh` refuses them): every scope ships what was integrated, and a package gets one fix round.
 
 `build_on_branch` (one branch per scope) is merged into the new integration branch before planning, with the base ref merged on top. Its commits are inherited: the plan verifies them (verify-only packages) and adds only what is missing. If the merge conflicts, the scope stops before planning; rebase the branch first. To build on two unrelated leftover branches, use two scopes.
 
@@ -121,18 +133,19 @@ Check in every 20 to 30 minutes, not more often:
 
 ## 4. Post-run
 
-1. Read the result: `summary`, then for each scope `status`, `blockers`, `dropped`, `owner_questions`, `gates_full`.
-2. For `needs_owner_decision`: put the blockers to the owner with plain options. Partial ship: re-launch with the same args plus the scope in `ship_partial` and `resumeFromRunId`; the agents before the merge gate should come back from the cache (ship_partial appears in no prompt), so in practice only the merge stage runs again. A policy violation needs the owner to look at what happened first.
-3. Dropped packages: list each with its final state and reason; each stays open in the repo's bookkeeping with a dated note (MR prep writes it). For `blocked`, quote the blocked note (`<rundir>/<scope>/<pkg>/run<N>/.vd-blocked.md`): usually the plan was wrong, not vibe. Propose the follow-up (re-run as a new scope with `build_on_branch` set to the package branch, or by hand). Verify-only packages' notes are listed in the result (`verification_note`).
-4. Clean up: for each `worktrees_to_clean` entry marked finished, `bash $SK/wt.sh remove --repo <repo> --path <path>`; keep failed packages' worktrees until the owner has looked. Then `du -sh <rundir>` (the scripts delete caches; logs stay) and `bash $SK/tmp-check.sh`.
-5. Final report: per scope the status, MR link and merge commit, packages and their final states, gates (naming any known failures hit), dropped work with reasons, and open owner questions.
+1. Read the result: `summary`, then for each scope `status`, `blockers`, `dropped`, `followups`, `followups_recorded`, `owner_questions`, `gates_full`.
+2. For `needs_owner_decision`: put the blockers to the owner with plain options. A policy violation is reported first and prominently; the owner must look at what happened before anything else. Zero integrated packages: everything is in `followups`; propose the next run below.
+3. Follow-ups: list them grouped by scope, deferred findings apart from packages not integrated (with final state, reason, open items, branch). For `blocked`, quote the blocked note (`<rundir>/<scope>/<pkg>/run<N>/.vd-blocked.md`): usually the plan was wrong, not vibe. If `followups_recorded` is false (or null because the scope stopped before the merge stage), file the entries listed in `followups_missing` (or all of them) in the profile's `followup_file` by hand, in a small bookkeeping commit. Verify-only packages' notes are listed in the result (`verification_note`).
+4. Feeding follow-ups into the next run: copy the relevant entries of `result.followups` into a new scope's `followups` in the next request file (a new integration branch, as always). For one or more `not_integrated` entries of one package, set that scope's `build_on_branch` to the entry's `branch`, so the work and its evidence carry over and the planner plans the open items around it. Deferred findings of shipped work need no `build_on_branch`. The planner and the plan reviewer get the entries verbatim and must cover each one or say why not. Each entry's `[vd:<scope>/<package>]` tag finds its bookkeeping line, which the next MR prep ticks.
+5. Clean up: for each `worktrees_to_clean` entry marked finished, `bash $SK/wt.sh remove --repo <repo> --path <path>`; keep the worktrees of packages filed as follow-ups: their branches are the evidence the next run builds on. Then `du -sh <rundir>` (the scripts delete caches; logs stay) and `bash $SK/tmp-check.sh`.
+6. Final report: per scope the status, MR link and merge commit, packages and their final states, gates (naming any known failures hit), follow-ups (and whether they were recorded), and open owner questions.
 
 ## Profile (`.claude/vibe-delivery.yaml`)
 
 Schema: `$SK/profile.schema.json`. Fields:
 
 - `version: 1`, `repo`, `default_branch`, `remote` (or `no_remote: true`), `worktree_root` (`~` allowed).
-- `bookkeeping`: `files` (shared tracking files, hunk-staged), `plan_entry_file` (where SETUP writes the plan-of-record entry), `convention` (how entries are written and ticked).
+- `bookkeeping`: `files` (shared tracking files, hunk-staged), `plan_entry_file` (where SETUP writes the plan-of-record entry), `followup_file` (where MR prep files follow-ups, usually the backlog), `convention` (how entries are written and ticked, and where follow-ups go in `followup_file`).
 - `merge`: `open_command` (`{source}`, `{target}`, `{title}`, `{description_file}`), `command` (`{iid}`, `{sha}`), `mr_exists_command` (`{branch}`; prints a count), `notes`.
 - `vm` (optional): `ssh`, `lock` (use the same lock name in every profile that shares the machine), `use_for`, `notes`.
 - `gates[]`: `name`, `cmd` (`{touched_dirs}`/`{touched_files}` placeholders), `paths` (bash patterns, `*` spans `/`), `level` (`package` per package and after each integration, `full` at MR prep, `both`), `timeout_min`, `failure_patterns` (ERE; capture groups make the failure id), `fatal_patterns` (any match makes a failure real).
@@ -148,7 +161,7 @@ repo: my-service
 default_branch: main
 remote: origin
 worktree_root: ~/worktrees/my-service
-bookkeeping: {files: [TODO.md], plan_entry_file: TODO.md, convention: "- [ ] task, ticked - [x] with a date"}
+bookkeeping: {files: [TODO.md], plan_entry_file: TODO.md, followup_file: TODO.md, convention: "- [ ] task, ticked - [x] with a date; follow-ups at the end"}
 merge:
   open_command: glab mr create --source-branch {source} --target-branch {target} --title {title} --description "$(cat {description_file})" --yes
   command: glab mr merge {iid} --sha {sha} --yes
@@ -165,12 +178,13 @@ Split an aggregate target such as `make verify` into its parts when it stops at 
 | Script | Use |
 |---|---|
 | `workflow.js` | the Workflow script; args only from `prepare-args.sh` |
-| `scope-branch.sh create/refresh/record` | the integration branch: create it before planning (build-on merge, inherited-commit list), merge the base ref again after a wait, commit the plan-of-record entry and push |
+| `scope-branch.sh create/refresh/record/merge` | the integration branch: create it before planning (build-on merge, inherited-commit list), merge the base ref again after a wait, commit the plan-of-record entry and push, and (integrator `script`) merge a package mechanically, aborting on conflict and reporting `tree_equal` |
 | `prepare-args.sh REQUEST.json` | resolves and validates profiles, embeds `plan.schema.json`, writes `args.json` |
 | `vibe-run.sh start/wait/run/check` | one vibe session; `--base` required; `result.json` with `delivered`, `new_commits`, `out_of_scope`, `blocked`, `policy_violations` |
 | `gates.sh start/wait/run` | the profile's gates for touched paths (plus `--verify-paths`/`--extra-cmd` for verify-only packages); `gates.json` with `ok`/`clean`/`ran` and known-failure classification |
 | `wt.sh create/remove` | unique worktrees; refuses collisions; never removes the main checkout |
 | `check-plan.sh PLAN.json [--inherited FILE]` | schema plus structural plan checks |
+| `tests/run.sh [PROFILE.yaml]...` | every offline check: `bash -n`, shellcheck, `node --check`, the schemas against the metaschema, profile validation, the mock harness (`tests/harness.mjs`: the workflow with stubbed agents, one case per outcome, agent counts per package) and the dry runs (`tests/dry-run.sh`: the real scripts against throwaway repos with `tests/fakevibe`). Runs no workflow and no real vibe |
 | `tmp-check.sh` | quiet unless /tmp is above the threshold or holds leftovers: any directory over 100 MB, untouched for an hour, with no file open in it (checked like `lsof`, from /proc) |
 
 `wait` prints `DONE` plus one compact JSON line, `STILL_RUNNING` (exit 75), or `DIED` (exit 70; `vibe-run.sh check --out DIR` recomputes the result from the worktree). Every script drops `LD_LIBRARY_PATH` first, so vibe can call them. Tools come from nixpkgs (`VD_PREFER_PATH=1` uses PATH instead).

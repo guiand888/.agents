@@ -11,13 +11,14 @@
 #     "run_tag": "2026-10-04a",            # unique per run; names dirs and worktrees
 #     "today": "2026-10-04",
 #     "jobdir": "/path/to/job/dir",        # per-run files go under <jobdir>/vd/<run_tag>/ (not /tmp)
-#     "ship_partial": [],                  # scope keys the owner allowed to merge with failed packages
-#     "max_fix_rounds": 2, "max_vibe_runs": 3, "max_turns": 150,   # optional
+#     "max_vibe_runs": 3, "max_turns": 150,  # optional
+#     "integrator": "sonnet",              # optional: "sonnet" (default) or "script" (mechanical merge, Sonnet only on conflict)
 #     "scopes": [
 #       { "key": "short-slug", "repo_path": "/abs/repo", "brief": "what to deliver ...",
 #         "integration_branch": "fix/some-branch",
 #         "build_on_branch": "optional existing branch to start from",
-#         "profile_path": "optional; default <repo_path>/.claude/vibe-delivery.yaml" }
+#         "profile_path": "optional; default <repo_path>/.claude/vibe-delivery.yaml",
+#         "followups": [ optional: entries of an earlier run's result.followups to deliver in this scope ] }
 #     ]
 #   }
 #
@@ -40,6 +41,10 @@ jobdir=$(jq_ -r '.jobdir // empty' "$REQ")
 [[ -n $today ]] || die "today is required"
 [[ -n $jobdir && $jobdir == /* ]] || die "jobdir must be an absolute path"
 case $jobdir in /tmp | /tmp/*) echo "warning: jobdir is under /tmp, which may be a shared RAM-backed tmpfs" >&2 ;; esac
+for gone in ship_partial max_fix_rounds; do
+  [[ $(jq_ "has(\"$gone\")" "$REQ") == false ]] || die "$gone is no longer supported: every scope ships what was integrated, and a package gets one fix round (see SKILL.md)"
+done
+case $(jq_ -r '.integrator // "sonnet"' "$REQ") in sonnet | script) ;; *) die "integrator must be \"sonnet\" or \"script\"" ;; esac
 dups=$(jq_ -r '[.scopes[].key] | group_by(.) | map(select(length > 1) | .[0]) | .[]' "$REQ")
 [[ -z $dups ]] || die "duplicate scope keys: $dups"
 (($(jq_ '.scopes | length' "$REQ") > 0)) || die "no scopes"
@@ -87,8 +92,7 @@ printf '%s\n' "${scopes[@]}" | jq_ -s \
   --arg skill_dir "$VD_DIR" --argjson plan_schema "$plan_schema" --slurpfile req "$REQ" '
   {
     run_tag: $run_tag, today: $today, jobdir: $jobdir, rundir: $rundir, skill_dir: $skill_dir,
-    ship_partial: ($req[0].ship_partial // []),
-    max_fix_rounds: ($req[0].max_fix_rounds // 2),
+    integrator: ($req[0].integrator // "sonnet"),
     max_vibe_runs: ($req[0].max_vibe_runs // 3),
     max_turns: ($req[0].max_turns // 150),
     plan_schema: $plan_schema,

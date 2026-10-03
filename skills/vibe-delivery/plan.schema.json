@@ -63,7 +63,7 @@
                 },
                 "high_risk": {
                   "type": "boolean",
-                  "description": "Set by the plan reviewer for concurrency, security or data-integrity work. A high-risk package is adjudicated by the senior reviewer even when the first reviewer approves."
+                  "description": "Set by the plan reviewer for concurrency, security or data-integrity work. Every package gets one code review; a high-risk package gets it from the senior reviewer instead of the standard one."
                 },
                 "repo_path": { "type": "string", "description": "Must equal the plan's repo_path. Work for another repository belongs to another scope; check-plan.sh rejects a mismatch." },
                 "title": { "type": "string" },

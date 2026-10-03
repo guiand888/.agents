@@ -8,6 +8,8 @@
 #   scope-branch.sh refresh --wt DIR --base-ref REF [--remote NAME]
 #   scope-branch.sh record  --wt DIR --file REL --entry FILE --entry-bytes N --message MSG
 #                           [--remote NAME --branch NAME]
+#   scope-branch.sh merge   --wt DIR --branch PKG_BRANCH --pkg-head SHA --fork SHA
+#                           [--expect-head SHA]
 #
 # create runs BEFORE planning, so the planner and the plan reviewer read the
 # exact tree every package forks from. It creates the branch from --build-on
@@ -38,13 +40,23 @@
 # commits only that file with MSG, and pushes the branch when --remote is
 # given. The worktree is private to the scope, so no hunk staging is needed;
 # a dirty tree is refused. Prints JSON: ok, head.
+#
+# merge is the mechanical integrator (the workflow's integrator "script"): in
+# the clean integration worktree, whose HEAD must be --expect-head when given,
+# it checks that PKG_BRANCH is at --pkg-head (the reviewed, gated head) and
+# runs `git merge --no-ff --no-edit PKG_BRANCH`. On a conflict it aborts the
+# merge, leaves HEAD where it was, and prints FAILED with conflicts: true and
+# the conflicting files, so the caller can hand the merge to an agent.
+# Otherwise it prints JSON: ok, merged, conflicts (false), pre_merge_sha, head,
+# tree_equal (HEAD^1 is --fork and the merge tree equals the --pkg-head tree,
+# so the gates that passed on the package also cover the merge).
 set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 usage() { sed -n '2,/^set -/{/^#/!d;/shellcheck/d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"; }
 
-REPO='' WTP='' BRANCH='' BASE_REF='' OUT='' BUILD_ON='' REMOTE='' FILE='' ENTRY='' ENTRY_BYTES='' MESSAGE=''
+REPO='' WTP='' BRANCH='' BASE_REF='' OUT='' BUILD_ON='' REMOTE='' FILE='' ENTRY='' ENTRY_BYTES='' MESSAGE='' PKG_HEAD='' FORK='' EXPECT_HEAD=''
 sub=${1:-}
 [[ -n $sub ]] && shift
 while (($#)); do
@@ -60,6 +72,9 @@ while (($#)); do
     --entry) ENTRY=$2; shift 2 ;;
     --entry-bytes) ENTRY_BYTES=$2; shift 2 ;;
     --message) MESSAGE=$2; shift 2 ;;
+    --pkg-head) PKG_HEAD=$2; shift 2 ;;
+    --fork) FORK=$2; shift 2 ;;
+    --expect-head) EXPECT_HEAD=$2; shift 2 ;;
     -h | --help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -169,6 +184,36 @@ case $sub in
     fi
     echo DONE
     jq_ -nc --arg head "$(git -C "$WTP" rev-parse HEAD)" '{ok: true, head: $head}'
+    ;;
+  merge)
+    [[ -n $WTP && -n $BRANCH && -n $PKG_HEAD && -n $FORK ]] || die "merge needs --wt, --branch, --pkg-head and --fork"
+    [[ -z $(git -C "$WTP" status --porcelain=v1 --untracked-files=all) ]] || fail "integration worktree $WTP is not clean"
+    pre=$(git -C "$WTP" rev-parse HEAD)
+    if [[ -n $EXPECT_HEAD && $pre != "$(git -C "$WTP" rev-parse "$EXPECT_HEAD^{commit}")" ]]; then
+      fail "integration head is $pre, expected $EXPECT_HEAD"
+    fi
+    tip=$(git -C "$WTP" rev-parse --verify -q "refs/heads/$BRANCH^{commit}") || fail "package branch $BRANCH does not exist"
+    want=$(git -C "$WTP" rev-parse "$PKG_HEAD^{commit}")
+    [[ $tip == "$want" ]] || fail "package branch $BRANCH is at $tip, not at the reviewed head $want"
+    if ! git -C "$WTP" merge --no-ff --no-edit "refs/heads/$BRANCH" >&2; then
+      files=$(git -C "$WTP" diff --name-only --diff-filter=U | lines_to_json)
+      git -C "$WTP" merge --abort >&2 || true
+      now=$(git -C "$WTP" rev-parse HEAD)
+      echo FAILED
+      jq_ -nc --arg pre "$pre" --arg now "$now" --argjson files "$files" \
+        '{ok: false, merged: false, conflicts: true, files: $files, pre_merge_sha: $pre, head: $now,
+          reason: "merge conflicts; aborted, HEAD unchanged"}'
+      exit 1
+    fi
+    head=$(git -C "$WTP" rev-parse HEAD)
+    teq=false
+    if [[ $(git -C "$WTP" rev-parse HEAD^1) == "$(git -C "$WTP" rev-parse "$FORK^{commit}")" &&
+      $(git -C "$WTP" rev-parse 'HEAD^{tree}') == "$(git -C "$WTP" rev-parse "$want^{tree}")" ]]; then
+      teq=true
+    fi
+    echo DONE
+    jq_ -nc --arg pre "$pre" --arg head "$head" --argjson teq "$teq" \
+      '{ok: true, merged: true, conflicts: false, pre_merge_sha: $pre, head: $head, tree_equal: $teq}'
     ;;
   *) usage; exit 2 ;;
 esac

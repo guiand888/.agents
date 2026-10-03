@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Fake vibe: behaviour from $STUB_MODE. Parses --workdir.
+while (($#)); do case $1 in --workdir) WD=$2; shift 2;; *) shift;; esac; done
+cd "$WD" || exit 9
+{ echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH-<unset>}"; echo "nix-on-path=$(command -v nix)"; } > "${STUB_ENV_OUT:-/dev/null}"
+case $STUB_MODE in
+  commit) mkdir -p src; echo "a$$" > src/a$$.txt; git add -A src; git commit -qm "feat: a";;
+  none) echo "did nothing";;
+  oos) mkdir -p src other; echo a > src/a.txt; echo b > other/b$$.txt; git add -A; git commit -qm "feat: a+b";;
+  dirty) mkdir -p src; echo a > src/a$$.txt; git add -A src; git commit -qm "feat: a"; echo x > src/leftover.txt;;
+  plan) echo '{"x":1}' > .vd-plan.json;;
+  verify) echo "checked: ok" > .vd-verify.md;;
+  verifycommit) echo "checked + fixed" > .vd-verify.md; mkdir -p src; echo v > src/v$$.txt; git add src; git commit -qm "fix: v";;
+  blocked) echo "premise false: work already present" > .vd-blocked.md;;
+  revertinherited) git rm -q other/inherited.txt; git commit -qm "revert inherited";;
+  pushmain) mkdir -p src; echo "p$$" > src/p$$.txt; git add -A; git commit -qm p; git push -q origin HEAD:main;;
+esac
+echo "vibe stub done ($STUB_MODE)"
