@@ -73,7 +73,8 @@
           "ids": { "type": "array", "items": { "type": "string" }, "description": "Failure ids (as failure_patterns extract them) that fail on the default branch too." },
           "signature": { "type": "string", "description": "Text seen in the log, for humans." },
           "reason": { "type": "string" },
-          "verified": { "type": "string", "description": "Where and when this was reproduced on the default branch." }
+          "verified": { "type": "string", "description": "Where and when this was reproduced on the default branch." },
+          "recheck": { "type": "string", "description": "One targeted shell command, run from the repository root of a default-branch checkout, that reproduces this failure: it exits non-zero while the failure persists (for Go, one `go test -run '^<id>$' <package>` on one of the ids). Pre-flight runs it; if it passes, the entry is stale and must be removed before launch, or a regression would pass as known." }
         }
       }
     },

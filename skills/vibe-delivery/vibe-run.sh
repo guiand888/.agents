@@ -3,13 +3,15 @@
 # vibe-run.sh -- run one vibe session in a worktree and record, mechanically,
 # whether it delivered. Part of the vibe-delivery skill.
 #
-#   vibe-run.sh start --wt DIR --prompt FILE --out DIR [--base REF] [--max-turns N]
-#                     [--allow GLOB]... [--expect-file REL] [--expect-commits yes|no]
+#   vibe-run.sh start --wt DIR --prompt FILE --out DIR --base REF [--commits-since REF]
+#                     [--max-turns N] [--allow GLOB]... [--expect-file REL]
+#                     [--expect-commits yes|no|any] [--blocked-file REL] [--prompt-bytes N]
 #                     [--lock NAME] [--timeout-min N] [--max-price USD]
 #                     [--guard-ref REF]... [--mr-check-cmd CMD]
 #   vibe-run.sh wait  --out DIR [--max-wait SECS]   # prints DONE | STILL_RUNNING | DIED
 #   vibe-run.sh run   <start args>                  # start + wait to the end (no time cap callers only)
-#   vibe-run.sh check --out DIR [--wt DIR --base REF --allow GLOB... --expect-file REL --expect-commits yes|no --mr-check-cmd CMD]
+#   vibe-run.sh check --out DIR [--wt DIR --base REF --commits-since REF --allow GLOB... --expect-file REL
+#                     --expect-commits yes|no|any --mr-check-cmd CMD]
 #                                                   # recompute result.json without running vibe
 #
 # What `start` does, detached from the caller:
@@ -21,14 +23,37 @@
 # VM) are serialized across sessions.
 #
 # OUT/result.json is written when vibe exits:
-#   state, vibe_exit, timed_out, head, base_sha, commits[], status_short[],
-#   changed_files[], out_of_scope[], expect_file_present, log_tail, reasons[],
-#   delivered
-# delivered = (commits beyond base, or none if --expect-commits no) AND a clean
-#             tree AND nothing outside the --allow globs AND the expect file
-#             exists (when given). --base defaults to HEAD at start, so a fix
-#             round must add new commits to count as delivered.
-#             AND no policy violation:
+#   state, vibe_exit, timed_out, head, base_sha, since_sha, commits[],
+#   new_commits, status_short[], changed_files[], out_of_scope[],
+#   expect_file_present, expect_file, blocked, blocked_text, log_tail,
+#   reasons[], delivered
+#
+# --base (required) is the sha the package branch was forked from. It is the
+# reference for the scope check and is never "HEAD at start":
+#   changed_files = git diff --name-only BASE HEAD   (a tree-to-tree diff)
+#                   + every path git status reports (uncommitted, untracked)
+#   out_of_scope  = changed_files not matching any --allow glob
+# Anything already on BASE (an inherited commit, a merged build-on branch, a
+# plan-of-record commit) is in both trees, so it never shows up as a change.
+# Only a run that alters such a file relative to BASE (for example by
+# reverting it) is out of scope.
+#
+# --commits-since (default: BASE) is the reference for "did this run add
+# commits": new_commits = git rev-list --count SINCE..HEAD. A fix round passes
+# the head it started from, so round 0's commits do not count for it.
+#
+# delivered = the commit expectation holds (yes: new_commits > 0; no:
+#             new_commits == 0; any: either, used for verify-only packages)
+#             AND a clean tree AND nothing out of scope AND the expect file
+#             exists (when given) AND vibe did not write the blocked file
+#             AND no policy violation.
+# --blocked-file REL: if vibe writes it (the spec's premise is false, or the
+#   work cannot be done within the allowed paths), it is moved to OUT,
+#   blocked=true, and the run is not delivered. The caller stops instead of
+#   continuing.
+# --prompt-bytes N: start refuses a prompt file whose size, ignoring trailing
+#   newlines, is not N bytes (catches a wrapper that truncated or rewrote it).
+# Policy checks:
 #   --guard-ref REF (repeatable; e.g. origin/main and main): the ref's sha is
 #     recorded at start; at the end a remote ref is re-fetched, and if the ref
 #     now contains any commit this run made, the run pushed or merged into a
@@ -43,7 +68,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 usage() { sed -n '2,/^set -/{/^#/!d;/shellcheck/d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"; }
 
-WT='' PROMPT='' OUT='' BASE='' MAX_TURNS=150 EXPECT_FILE='' EXPECT_COMMITS=yes LOCK='' TIMEOUT_MIN=120 MAX_PRICE='' MAX_WAIT=540 MR_CHECK_CMD=''
+WT='' PROMPT='' OUT='' BASE='' SINCE='' MAX_TURNS=150 EXPECT_FILE='' EXPECT_COMMITS=yes BLOCKED_FILE='' PROMPT_BYTES=''
+LOCK='' TIMEOUT_MIN=120 MAX_PRICE='' MAX_WAIT=540 MR_CHECK_CMD=''
 ALLOW=() GUARD_REFS=() GUARD_START=()
 
 parse() {
@@ -53,6 +79,9 @@ parse() {
       --prompt) PROMPT=$2; shift 2 ;;
       --out) OUT=$2; shift 2 ;;
       --base) BASE=$2; shift 2 ;;
+      --commits-since) SINCE=$2; shift 2 ;;
+      --blocked-file) BLOCKED_FILE=$2; shift 2 ;;
+      --prompt-bytes) PROMPT_BYTES=$2; shift 2 ;;
       --max-turns) MAX_TURNS=$2; shift 2 ;;
       --allow) ALLOW+=("$2"); shift 2 ;;
       --expect-file) EXPECT_FILE=$2; shift 2 ;;
@@ -67,13 +96,14 @@ parse() {
       *) die "unknown argument: $1" ;;
     esac
   done
-  [[ $EXPECT_COMMITS == yes || $EXPECT_COMMITS == no ]] || die "--expect-commits must be yes or no"
+  [[ $EXPECT_COMMITS == yes || $EXPECT_COMMITS == no || $EXPECT_COMMITS == any ]] || die "--expect-commits must be yes, no or any"
 }
 
 # Persist the run's parameters so the detached runner and `check` share them.
 save_params() {
   {
-    printf 'WT=%q\nPROMPT=%q\nBASE_SHA=%q\nMAX_TURNS=%q\nEXPECT_FILE=%q\n' "$WT" "$PROMPT" "$BASE_SHA" "$MAX_TURNS" "$EXPECT_FILE"
+    printf 'WT=%q\nPROMPT=%q\nBASE_SHA=%q\nSINCE_SHA=%q\nMAX_TURNS=%q\nEXPECT_FILE=%q\nBLOCKED_FILE=%q\n' \
+      "$WT" "$PROMPT" "$BASE_SHA" "$SINCE_SHA" "$MAX_TURNS" "$EXPECT_FILE" "$BLOCKED_FILE"
     printf 'EXPECT_COMMITS=%q\nLOCK=%q\nTIMEOUT_MIN=%q\nMAX_PRICE=%q\n' "$EXPECT_COMMITS" "$LOCK" "$TIMEOUT_MIN" "$MAX_PRICE"
     printf 'MR_CHECK_CMD=%q\nRUN_START=%q\n' "$MR_CHECK_CMD" "${RUN_START:-}"
     local g
@@ -141,11 +171,23 @@ check_policy() {
 # compute_result <vibe_exit> <timed_out> -- inspect the worktree, write result.json.
 compute_result() {
   local vibe_exit=$1 timed_out=$2 head commits status changed oos f reasons=() expect_present=false delivered=true ncommits
+  local blocked=false blocked_text='' expect_out=''
   head=$(git -C "$WT" rev-parse HEAD)
   commits=$(git -C "$WT" log --format='%h %s' "$BASE_SHA..HEAD")
-  ncommits=$(git -C "$WT" rev-list --count "$BASE_SHA..HEAD")
-  # Porcelain status, minus the expect file (it is a hand-off, not work).
-  status=$(git -C "$WT" status --porcelain=v1 --untracked-files=all | { if [[ -n $EXPECT_FILE ]]; then grep -vxF -- "?? $EXPECT_FILE" || true; else cat; fi; })
+  ncommits=$(git -C "$WT" rev-list --count "${SINCE_SHA:-$BASE_SHA}..HEAD")
+  # The blocked note and the expect file are hand-offs, not work: move them to
+  # OUT first, so the status below and the next run start clean.
+  if [[ -n $BLOCKED_FILE && -f $WT/$BLOCKED_FILE ]]; then
+    mv -f -- "$WT/$BLOCKED_FILE" "$OUT/$(basename -- "$BLOCKED_FILE")"
+  fi
+  if [[ -n $BLOCKED_FILE && -f $OUT/$(basename -- "$BLOCKED_FILE") ]]; then
+    blocked=true
+    blocked_text=$(head -c 4000 "$OUT/$(basename -- "$BLOCKED_FILE")")
+  fi
+  if [[ -n $EXPECT_FILE && -f $WT/$EXPECT_FILE ]]; then
+    mv -f -- "$WT/$EXPECT_FILE" "$OUT/$(basename -- "$EXPECT_FILE")"
+  fi
+  status=$(git -C "$WT" status --porcelain=v1 --untracked-files=all)
   # Committed changes since base, plus anything still uncommitted.
   changed=$( {
     git -C "$WT" diff --name-only "$BASE_SHA" HEAD
@@ -158,21 +200,22 @@ compute_result() {
   done <<<"$changed"
 
   if [[ -n $EXPECT_FILE ]]; then
-    # Moved out of the worktree so the next run starts clean; a later
-    # `check` finds it in OUT.
-    if [[ -f $WT/$EXPECT_FILE ]]; then
-      mv -f -- "$WT/$EXPECT_FILE" "$OUT/$(basename -- "$EXPECT_FILE")"
-    fi
+    # A later `check` finds it in OUT.
     if [[ -f $OUT/$(basename -- "$EXPECT_FILE") ]]; then
       expect_present=true
+      expect_out=$OUT/$(basename -- "$EXPECT_FILE")
     else
       delivered=false
       reasons+=("expected file $EXPECT_FILE was not written")
     fi
   fi
+  if [[ $blocked == true ]]; then
+    delivered=false
+    reasons+=("vibe reported the package blocked ($BLOCKED_FILE)")
+  fi
   if [[ $EXPECT_COMMITS == yes && $ncommits == 0 ]]; then
     delivered=false
-    reasons+=("no commits beyond base $BASE_SHA")
+    reasons+=("no commits beyond ${SINCE_SHA:-$BASE_SHA}")
   fi
   if [[ $EXPECT_COMMITS == no && $ncommits != 0 ]]; then
     delivered=false
@@ -204,6 +247,11 @@ compute_result() {
     --argjson timed_out "$timed_out" \
     --arg head "$head" \
     --arg base_sha "$BASE_SHA" \
+    --arg since_sha "${SINCE_SHA:-$BASE_SHA}" \
+    --argjson new_commits "$ncommits" \
+    --argjson blocked "$blocked" \
+    --arg blocked_text "$blocked_text" \
+    --arg expect_out "$expect_out" \
     --argjson commits "$(printf '%s\n' "$commits" | lines_to_json)" \
     --argjson status_short "$(printf '%s\n' "$status" | lines_to_json)" \
     --argjson changed_files "$(printf '%s\n' "$changed" | lines_to_json)" \
@@ -216,9 +264,10 @@ compute_result() {
     --argjson perrors "$(printf '%s\n' "${perrors[@]+"${perrors[@]}"}" | lines_to_json)" \
     --arg out "$OUT" \
     '{state:$state, delivered:$delivered, reasons:$reasons, vibe_exit:$vibe_exit, timed_out:$timed_out,
-      head:$head, base_sha:$base_sha, commits:$commits, status_short:$status_short,
-      changed_files:$changed_files, out_of_scope:$out_of_scope,
-      expect_file_present:$expect_file_present, policy_violations:$policy,
+      head:$head, base_sha:$base_sha, since_sha:$since_sha, commits:$commits, new_commits:$new_commits,
+      status_short:$status_short, changed_files:$changed_files, out_of_scope:$out_of_scope,
+      expect_file_present:$expect_file_present, expect_file:$expect_out,
+      blocked:$blocked, blocked_text:$blocked_text, policy_violations:$policy,
       policy_check_errors:$perrors, out_dir:$out, log_tail:$log_tail}' >"$OUT/result.json.tmp"
   mv "$OUT/result.json.tmp" "$OUT/result.json"
 }
@@ -273,8 +322,18 @@ cmd_start() {
   local size
   size=$(wc -c <"$PROMPT")
   ((size <= 100000)) || die "prompt is $size bytes; keep it under 100000 (one argv entry is capped at 128 KiB). Point vibe at files instead of inlining them."
+  if [[ -n $PROMPT_BYTES ]]; then
+    local got
+    got=$(printf '%s' "$(cat "$PROMPT")" | wc -c)
+    ((got == PROMPT_BYTES)) || die "PROMPT_MISMATCH: $PROMPT has $got bytes (ignoring trailing newlines), expected $PROMPT_BYTES; rewrite it exactly as given"
+  fi
   [[ $MAX_TURNS =~ ^[0-9]+$ ]] || die "--max-turns must be a number"
-  BASE_SHA=$(git -C "$WT" rev-parse --verify "${BASE:-HEAD}^{commit}") || die "cannot resolve base ${BASE:-HEAD}"
+  # No default: the base is the package's fork sha, which only the caller knows.
+  # "HEAD at start" silently counted inherited or earlier-round work as this run's.
+  [[ -n $BASE ]] || die "start needs --base (the sha the branch was forked from)"
+  BASE_SHA=$(git -C "$WT" rev-parse --verify "$BASE^{commit}") || die "cannot resolve base $BASE"
+  git -C "$WT" merge-base --is-ancestor "$BASE_SHA" HEAD || die "base $BASE_SHA is not an ancestor of the worktree's HEAD"
+  SINCE_SHA=$(git -C "$WT" rev-parse --verify "${SINCE:-$BASE_SHA}^{commit}") || die "cannot resolve --commits-since $SINCE"
   mkdir -p "$OUT"
   if [[ -f $OUT/pid ]] && kill -0 "$(cat "$OUT/pid")" 2>/dev/null; then
     die "a run is already in progress in $OUT (pid $(cat "$OUT/pid")); wait for it instead"
@@ -311,9 +370,11 @@ cmd_check() {
     # shellcheck source=/dev/null
     source "$OUT/params.sh"
     BASE=${BASE:-$BASE_SHA}
+    SINCE=${SINCE:-${SINCE_SHA:-}}
   fi
   [[ -n $WT && -n $BASE ]] || die "check needs --wt and --base (or an --out holding a started run)"
   BASE_SHA=$(git -C "$WT" rev-parse --verify "$BASE^{commit}") || die "cannot resolve base $BASE"
+  SINCE_SHA=$(git -C "$WT" rev-parse --verify "${SINCE:-$BASE_SHA}^{commit}") || die "cannot resolve --commits-since $SINCE"
   mkdir -p "$OUT"
   OUT=$(cd "$OUT" && pwd)
   rm -f "$OUT/result.json"
@@ -324,7 +385,7 @@ cmd_check() {
 
 # Second line after DONE: the result without the log tail, one compact line,
 # so a wrapper agent can copy it verbatim.
-print_result() { jq_ -c 'del(.log_tail)' "$OUT/result.json"; }
+print_result() { jq_ -c 'del(.log_tail) | .blocked_text |= (. // "" | .[0:600])' "$OUT/result.json"; }
 
 case ${1:-} in
   start) shift; cmd_start "$@" ;;

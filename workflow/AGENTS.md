@@ -37,7 +37,9 @@ Batch sizing, incremental delivery, MVP approach, durable task tracking, and mul
 
 When an external coding CLI writes the code and agents plan, review and merge (the `vibe-delivery` skill, configured per repository by `.claude/vibe-delivery.yaml`):
 
-- Decide delivery mechanically: new commits beyond the run's base, a clean tree, nothing outside the package's declared files, and gates run by a script. Never on an agent's report.
+- Decide delivery mechanically: new commits beyond the run's base (the sha the package forked from, passed explicitly, never "HEAD at start"), a clean tree, nothing outside the package's declared files, and gates run by a script. Never on an agent's report. The one exception to "new commits" is a verify-only package checking work that is already on the branch: it is delivered by a written verification note and its own test commands passing as gates.
+- When building on an existing branch, create the integration branch before planning and tell the planner, from git, which commits it already holds; plan verification around them, never a package that recreates them.
+- Do not double the coding CLI with agent work: the plan review is the only ground-truthing of specs, the gates are the only builds, one reviewer reads each round, and a senior adjudicator is called only on a disputed or high-risk package.
 - Run the CLI detached, with stdin from `/dev/null`, and wait in bounded chunks below the shell time cap; never let a supervising agent return while the CLI is still running.
 - Validate plans before review: unique package ids, dependencies only on earlier waves, disjoint file scopes within a wave, every package in the scope's own repository.
 - Start a package only after the packages it depends on are integrated; mark it blocked, not run, when one was dropped.

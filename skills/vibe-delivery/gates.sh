@@ -5,6 +5,7 @@
 # Part of the vibe-delivery skill.
 #
 #   gates.sh start --profile FILE --wt DIR --base REF --out DIR [--level package|full] [--allow GLOB]...
+#                  [--verify-paths GLOB]... [--extra-cmd CMD]...
 #   gates.sh wait  --out DIR [--max-wait SECS]   # prints DONE | STILL_RUNNING | DIED
 #   gates.sh run   <start args>                  # start + wait to the end (no time cap callers, e.g. vibe)
 #
@@ -12,6 +13,13 @@
 # --base is the ref the branch forked from; touched paths are
 #   git diff --name-only $(git merge-base BASE HEAD) HEAD
 # --allow (optional, repeatable) reports touched files outside those globs.
+# --verify-paths GLOB (repeatable): also treat every tracked file matching GLOB
+#   as touched. A verify-only package can end with no commits, which leaves
+#   nothing touched and would skip every path-scoped gate; this makes the
+#   profile's gates cover the work it verifies.
+# --extra-cmd CMD (repeatable): an extra gate, named extra-1, extra-2, ...,
+#   run at any level with no path filter; any non-zero exit fails it. The
+#   workflow passes a verify-only package's own test commands here.
 #
 # A gate runs when its `level` matches (package, full, or both) and at least one
 # touched path matches its `paths` (no `paths` = always). In a command,
@@ -30,7 +38,8 @@
 #
 # OUT/gates.json: head, base_sha, merge_base, commits_beyond_base, dirty,
 # level, touched[], out_of_scope[], gates[{name,status,exit,secs,
-# failure_ids[],unknown_failure_ids[],fatal,log}], ok, clean.
+# failure_ids[],unknown_failure_ids[],fatal,log}], ran (gates not skipped),
+# ok, clean.
 #   ok    = tree clean, no out_of_scope, every gate pass|known_only|skipped
 #   clean = ok and no gate is known_only
 set -euo pipefail
@@ -40,7 +49,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 usage() { sed -n '2,/^set -/{/^#/!d;/shellcheck/d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"; }
 
 PROFILE='' WT='' BASE='' OUT='' LEVEL=package MAX_WAIT=540
-ALLOW=()
+ALLOW=() VERIFY_PATHS=() EXTRA_CMDS=()
 
 parse() {
   while (($#)); do
@@ -51,6 +60,8 @@ parse() {
       --out) OUT=$2; shift 2 ;;
       --level) LEVEL=$2; shift 2 ;;
       --allow) ALLOW+=("$2"); shift 2 ;;
+      --verify-paths) VERIFY_PATHS+=("$2"); shift 2 ;;
+      --extra-cmd) EXTRA_CMDS+=("$2"); shift 2 ;;
       --max-wait) MAX_WAIT=$2; shift 2 ;;
       -h | --help) usage; exit 0 ;;
       *) die "unknown argument: $1" ;;
@@ -75,13 +86,28 @@ runner() {
   ncommits=$(git -C "$WT" rev-list --count "$merge_base..HEAD")
   [[ -n $(git -C "$WT" status --porcelain=v1 --untracked-files=all) ]] && dirty=true
   touched=$(git -C "$WT" diff --name-only "$merge_base" HEAD)
+  # Allowed-path check: only real changes, before the verify paths are added.
+  local changed=$touched
   local f
   if ((${#ALLOW[@]})); then
     while IFS= read -r f; do
       [[ -z $f ]] && continue
       path_allowed "$f" "${ALLOW[@]}" || oos+="$f"$'\n'
-    done <<<"$touched"
+    done <<<"$changed"
   fi
+  if ((${#VERIFY_PATHS[@]})); then
+    local extra_touched='' vf
+    while IFS= read -r vf; do
+      [[ -n $vf ]] && path_allowed "$vf" "${VERIFY_PATHS[@]}" && extra_touched+="$vf"$'\n'
+    done < <(git -C "$WT" ls-files)
+    touched=$(printf '%s\n%s' "$touched" "$extra_touched" | sed '/^$/d' | sort -u)
+  fi
+  # Extra command gates join the profile's gates: level both, no paths.
+  local ei=0 ec
+  for ec in "${EXTRA_CMDS[@]+"${EXTRA_CMDS[@]}"}"; do
+    ei=$((ei + 1))
+    jq_ --arg n "extra-$ei" --arg c "$ec" '.gates += [{name: $n, cmd: $c, level: "both"}]' "$prof" >"$prof.tmp" && mv "$prof.tmp" "$prof"
+  done
 
   local known
   known=$(jq_ -r '[.known_master_failures[]?.ids[]?] | .[]' "$prof")
@@ -195,6 +221,7 @@ runner() {
      | ($g | all(.status == "pass" or .status == "known_only" or .status == "skipped")) as $gates_ok
      | {head:$head, base_sha:$base_sha, merge_base:$merge_base, commits_beyond_base:$commits,
         dirty:$dirty, level:$level, touched:$touched, out_of_scope:$oos, gates:$g, log:$log,
+        ran: ($g | map(select(.status != "skipped")) | length),
         ok: ($gates_ok and ($dirty | not) and ($oos | length == 0)),
         clean: ($gates_ok and ($dirty | not) and ($oos | length == 0) and ($g | all(.status != "known_only")))}' \
     >"$OUT/gates.json.tmp"
@@ -213,10 +240,15 @@ cmd_start() {
   profile_json "$PROFILE" >"$OUT/profile.json" || die "cannot read profile $PROFILE"
   BASE_SHA=$(git -C "$WT" rev-parse --verify "$BASE^{commit}") || die "cannot resolve base $BASE"
   {
-    printf 'WT=%q\nBASE_SHA=%q\nLEVEL=%q\nALLOW=(' "$WT" "$BASE_SHA" "$LEVEL"
-    local g
-    for g in "${ALLOW[@]+"${ALLOW[@]}"}"; do printf '%q ' "$g"; done
-    printf ')\n'
+    printf 'WT=%q\nBASE_SHA=%q\nLEVEL=%q\n' "$WT" "$BASE_SHA" "$LEVEL"
+    local g arr
+    for arr in ALLOW VERIFY_PATHS EXTRA_CMDS; do
+      local -n ref=$arr
+      printf '%s=(' "$arr"
+      for g in "${ref[@]+"${ref[@]}"}"; do printf '%q ' "$g"; done
+      printf ')\n'
+      unset -n ref
+    done
   } >"$OUT/params.sh"
   bg_start "$OUT" "${BASH_SOURCE[0]}" _runner "$OUT"
   echo "STARTED pid $(cat "$OUT/pid") out $OUT"
@@ -224,7 +256,7 @@ cmd_start() {
 
 # Second line after DONE: compact summary a wrapper agent copies verbatim.
 print_summary() {
-  jq_ -c '{ok, clean, dirty, head, merge_base, commits_beyond_base, out_of_scope, log,
+  jq_ -c '{ok, clean, ran, dirty, head, merge_base, commits_beyond_base, out_of_scope, log,
     gates: [.gates[] | {name, status, exit, failure_ids, unknown_failure_ids, log}]}' "$OUT/gates.json"
 }
 
