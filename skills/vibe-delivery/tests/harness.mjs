@@ -53,6 +53,9 @@ const CASES = {
   'script-clean': { integrator: 'script', pkgs: { 'wp1': { review: 'ship' } } },
   'script-conflict': { integrator: 'script', pkgs: { 'wp1': { review: 'ship', conflict: true } } },
   'followups-missing': { missingTag: true, pkgs: { 'wp1': { review: 'deferrable' } } },
+  'verify-only': { pkgs: { 'wp1': { review: 'ship', kind: 'verify_only', zeroCommits: true } } },
+  blocked: { pkgs: { 'wp1': { blocked: true }, 'wp2': { review: 'ship' } } },
+  vm: { pkgs: { 'wp1': { review: 'ship', needs_vm: true } } },
 }
 
 async function runCase(name, C) {
@@ -77,7 +80,7 @@ async function runCase(name, C) {
       wave: w,
       packages: ids.filter((id) => (C.pkgs[id].wave || 1) === w).map((id) => {
         const x = C.pkgs[id]
-        const k = { id, kind: 'change', repo_path: scope.repo_path, title: id, branch: scope.integration_branch + '-' + id, files: ['src/' + id + '/'], spec: 'spec ' + id, acceptance: ['a'], tests: ['make test-' + id], needs_vm: false, depends_on: x.deps || [] }
+        const k = { id, kind: x.kind || 'change', repo_path: scope.repo_path, title: id, branch: scope.integration_branch + '-' + id, files: ['src/' + id + '/'], spec: 'spec ' + id, acceptance: ['a'], tests: ['make test-' + id], needs_vm: !!x.needs_vm, depends_on: x.deps || [] }
         if (x.high_risk) k.high_risk = true
         return k
       }),
@@ -112,6 +115,11 @@ async function runCase(name, C) {
         check(prompt.includes('BLOCKING-' + id), l + ': fix prompt lacks the blocking finding')
         check(!prompt.includes('DEFERRABLE-' + id), l + ': fix prompt carries a deferrable finding')
       }
+      if (S.kind === 'verify_only') check(prompt.includes('--expect-commits any') && prompt.includes("--expect-file '.vd-verify.md'"), l + ': verify_only run without --expect-commits any / --expect-file')
+      else check(prompt.includes('--expect-commits yes') && prompt.includes("--blocked-file '.vd-blocked.md'"), l + ': change run without --expect-commits yes / --blocked-file')
+      check(!!S.needs_vm === prompt.includes("--lock 'vmlock'"), l + ': VM lock ' + (S.needs_vm ? 'missing' : 'without needs_vm'))
+      if (S.blocked) return raw({ delivered: false, blocked: true, blocked_text: 'premise false', reasons: ['blocked'], commits: [], out_of_scope: [] })
+      if (S.zeroCommits) { pkgHead[kid] = forkOf[kid]; return raw({ delivered: true, reasons: [], commits: [], new_commits: 0, out_of_scope: [], head: forkOf[kid], expect_file: '/out/.vd-verify.md' }) }
       if (S.policy) return raw({ delivered: false, reasons: ['policy'], commits: ['c'], out_of_scope: [], policy_violations: ['an MR exists for the branch'] })
       pkgHead[kid] = sha()
       return raw({ delivered: true, reasons: [], commits: ['c'], new_commits: 1, out_of_scope: [], head: pkgHead[kid] })
@@ -119,6 +127,7 @@ async function runCase(name, C) {
     if (l.startsWith('gates:')) {
       if (id === 'full') return raw({ ok: true, clean: true, head: mrHead, gates: [], out_of_scope: [], log: '/l', ran: 3 })
       if (id.startsWith('integrate-')) return raw({ ok: true, clean: true, head: H[key], gates: [], log: '/l', ran: 1 })
+      if (S.kind === 'verify_only') check(prompt.includes("--extra-cmd 'make test-" + id + "'") && prompt.includes('--verify-paths'), l + ': verify_only gates without --extra-cmd/--verify-paths')
       const red = S.fixGatesRed && parts[3] === 'r1'
       return raw({ ok: !red, clean: !red, head: pkgHead[key + '/' + id], gates: red ? [{ name: 't', status: 'fail' }] : [], log: '/l', ran: 1 })
     }
@@ -162,7 +171,7 @@ async function runCase(name, C) {
     const t = new Set()
     for (const id of ids) {
       const S = C.pkgs[id]
-      if (S.review === 'deferrable' || S.review === 'blocking' || S.review === 'reject' || S.review === null || S.policy || S.deps) t.add('[vd:' + scope.key + '/' + id + ']')
+      if (S.review === 'deferrable' || S.review === 'blocking' || S.review === 'reject' || S.review === null || S.policy || S.deps || S.blocked) t.add('[vd:' + scope.key + '/' + id + ']')
     }
     return [...t]
   }
@@ -211,6 +220,9 @@ async function runCase(name, C) {
     'review-died': () => { check(pk.wp1.final === 'review_failed' && !has(/^vibe:demo:wp1:2/) && pk.wp2.final === 'integrated' && sc.status === 'merged', 'review-died: shipped or fixed on silence') },
     'script-clean': () => { check(has(/^merge:demo:wp1/) && !has(/^integrate:/) && sc.status === 'merged', 'script-clean: Sonnet integrator ran') },
     'script-conflict': () => { check(has(/^merge:demo:wp1/) && has(/^integrate:demo:wp1/) && /conflicted/.test(prompts['integrate:demo:wp1']) && sc.status === 'merged', 'script-conflict: no Sonnet fallback') },
+    'verify-only': () => { check(pk.wp1.final === 'integrated' && pk.wp1.integration && pk.wp1.integration.merged === false && !has(/^(integrate|merge):/) && sc.status === 'merged', 'verify-only: zero-commit package not integrated without a merge') },
+    blocked: () => { check(pk.wp1.final === 'blocked' && labels.filter((x) => /^vibe:demo:wp1/.test(x)).length === 1 && !has(/^review:demo:wp1/) && pk.wp2.final === 'integrated' && sc.status === 'merged' && fuOf('wp1').some((f) => f.kind === 'not_integrated' && /blocked note .*\.vd-blocked\.md/.test(f.evidence)), 'blocked: wrong outcome or no blocked note in the follow-up') },
+    vm: () => { check(pk.wp1.final === 'integrated', 'vm: not shipped') },
     'followups-missing': () => { check(sc.status === 'merged' && sc.followups_recorded === false && (sc.followups_missing || []).length === 1 && /NOT all recorded/.test(res.summary[0]), 'followups-missing: not reported') },
   }
   E[name]()

@@ -578,6 +578,7 @@ async function deliverPackage(s, plan, setup, pkg, forkSha) {
       rec.runs.push({ run: runNo, mode: m, delivered: !!res.delivered, reasons: res.reasons || [], head: res.head || null, new_commits: res.new_commits, commits: res.commits || [], out_of_scope: res.out_of_scope || [], blocked: !!res.blocked, policy_violations: res.policy_violations || [], policy_check_errors: res.policy_check_errors || [], start_failed: res.start_failed || '' })
       if (res.policy_violations && res.policy_violations.length) return { ok: false, policy: true, why: 'POLICY VIOLATION (the package is stopped, no further rounds): ' + res.policy_violations.join('; ') }
       if (res.policy_check_errors && res.policy_check_errors.length) log(key + ':' + pkg.id + ': policy check could not run: ' + res.policy_check_errors.join('; '))
+      if (res.blocked) rec.blocked_note = out + '/' + BLOCKED_NOTE
       if (res.blocked) return { ok: false, blocked: true, why: 'vibe reported the package blocked (no continuation): ' + (res.blocked_text || '(see ' + out + '/' + BLOCKED_NOTE + ')') }
       if (res.start_failed && !/PROMPT_MISMATCH/.test(res.start_failed)) return { ok: false, why: 'run could not start: ' + res.start_failed }
       if (res.delivered) {
@@ -794,7 +795,7 @@ const FOLLOWUP_HEADING = '## Deferred / follow-ups'
 const followupTag = (scope, id) => 'vd:' + scope + '/' + id
 function packageFollowups(s, r) {
   const base = { scope: s.key, repo: s.repo_path, integration_branch: s.integration_branch, package: r.id, title: r.title || '', branch: r.branch || '', final: r.final, date: A.today, run_tag: A.run_tag }
-  const where = 'run dir ' + RUN + '/' + s.key + '/' + r.id + (r.worktree ? '; worktree ' + r.worktree : '') + (r.head ? '; head ' + r.head : '')
+  const where = 'run dir ' + RUN + '/' + s.key + '/' + r.id + (r.blocked_note ? '; blocked note ' + r.blocked_note : '') + (r.worktree ? '; worktree ' + r.worktree : '') + (r.head ? '; head ' + r.head : '')
   const out = []
   const add = (kind, f, evidence) => out.push(Object.assign({}, base, { kind, severity: f.severity || '', summary: f.summary, file: f.file || '', line: f.line || '', required_fix: f.required_fix || '', evidence: evidence || '' }))
   if (!r.integrated) {
