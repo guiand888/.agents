@@ -16,12 +16,25 @@
     "bookkeeping": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["files", "plan_entry_file", "followup_file", "convention"],
+      "required": ["files", "plan_entry_file", "convention"],
+      "oneOf": [
+        { "required": ["followup_file"] },
+        { "required": ["followup_command"] }
+      ],
       "properties": {
         "files": { "type": "array", "items": { "type": "string" }, "description": "Shared tracking files. Stage only your own hunks in them." },
         "plan_entry_file": { "type": "string", "description": "Where SETUP writes the plan's bookkeeping_entry." },
-        "followup_file": { "type": "string", "description": "Where MR prep files every follow-up: each deferrable review finding of a shipped package and each package that was not integrated, one dated line per item naming the scope, package, branch and finding, tagged [vd:<scope>/<package>]. Usually the repo's backlog file. The convention should say where in it new open items go." },
-        "convention": { "type": "string", "description": "How entries are written and ticked in this repo." }
+        "followup_file": { "type": "string", "description": "File mode: where MR prep files every follow-up itself (vibe writes the lines): each deferrable review finding of a shipped package and each package that was not integrated, one dated line per item naming the scope, package, branch and finding, tagged [vd:<scope>/<package>]. Usually the repo's backlog file. The convention should say where in it new open items go. Mutually exclusive with followup_command; exactly one is required." },
+        "followup_command": { "type": "string", "description": "Command mode: shell template the MR-prep stage runs itself (not vibe), once per follow-up whose tag is not already filed, to create one tracker issue. Placeholders, substituted shell-quoted: {title}, {description_file}, {labels}. Must print the created issue's URL or number on stdout. Mutually exclusive with followup_file; exactly one is required." },
+        "followup_labels": { "type": "string", "description": "Command mode only: default labels (this repo's label-string format, e.g. a comma-separated list) added to every follow-up issue. Used for a follow-up whose package was not integrated, and as the fallback for a deferred finding when followup_labels_deferred is absent." },
+        "followup_labels_deferred": { "type": "string", "description": "Command mode only, optional: labels for a deferred-finding follow-up (a shipped package's non-blocking review finding), overriding followup_labels for that case; falls back to followup_labels if absent." },
+        "followup_dedupe_command": { "type": "string", "description": "Command mode only: shell template run once per [vd:<scope>/<package>] tag before followup_command. Placeholder {tag}. Must print a count greater than 0 on stdout if an open issue already carries that tag in its description, so a re-run does not duplicate that package's issues." },
+        "convention": { "type": "string", "description": "How entries are written and ticked in this repo (file mode), or how follow-up issues are labeled and titled beyond followup_labels (command mode)." }
+      },
+      "dependentRequired": {
+        "followup_labels": ["followup_command"],
+        "followup_labels_deferred": ["followup_command"],
+        "followup_dedupe_command": ["followup_command"]
       }
     },
     "merge": {

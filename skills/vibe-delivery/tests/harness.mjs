@@ -18,7 +18,7 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 const workflow = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'budget', src)
 const q = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'"
 
-function mockArgs(integrator) {
+function mockArgs(integrator, bookkeeping) {
   return {
     run_tag: 'mock1', today: '2026-01-02', jobdir: '/jobs/demo', rundir: '/jobs/demo/vd/mock1', skill_dir: '/SK',
     max_vibe_runs: 3, max_turns: 150, integrator, plan_schema: { type: 'object' },
@@ -27,7 +27,7 @@ function mockArgs(integrator) {
       profile_json: '/jobs/demo/profiles/demo.json', profile_path: '/repo/demo/.claude/vibe-delivery.yaml',
       profile: {
         version: 1, repo: 'demo', default_branch: 'main', remote: 'origin', no_remote: false, base_ref: 'origin/main', worktree_root: '/wt',
-        bookkeeping: { files: ['TODO.md', 'BACKLOG.md'], plan_entry_file: 'TODO.md', followup_file: 'BACKLOG.md', convention: 'c' },
+        bookkeeping: bookkeeping || { files: ['TODO.md', 'BACKLOG.md'], plan_entry_file: 'TODO.md', followup_file: 'BACKLOG.md', convention: 'c' },
         merge: { open_command: 'forge mr create {source}', command: 'forge mr merge {iid} --sha {sha}', mr_exists_command: 'count {branch}' },
         vm: { ssh: 'u@vm', lock: 'vmlock' }, gates: [{ name: 't', cmd: 'true' }],
       },
@@ -53,13 +53,24 @@ const CASES = {
   'script-clean': { integrator: 'script', pkgs: { 'wp1': { review: 'ship' } } },
   'script-conflict': { integrator: 'script', pkgs: { 'wp1': { review: 'ship', conflict: true } } },
   'followups-missing': { missingTag: true, pkgs: { 'wp1': { review: 'deferrable' } } },
+  'followups-issues': {
+    pkgs: { 'wp1': { review: 'deferrable' }, 'wp2': { review: 'reject' } },
+    bookkeeping: {
+      files: ['TODO.md', 'BACKLOG.md'], plan_entry_file: 'TODO.md',
+      followup_command: "fakeglab create --title {title} --body {description_file} --label {labels}",
+      followup_dedupe_command: 'fakeglab count {tag}',
+      followup_labels: 'workflow::todo,version::MVP,size::task',
+      followup_labels_deferred: 'workflow::todo,version::MVP,size::nit',
+      convention: 'c',
+    },
+  },
   'verify-only': { pkgs: { 'wp1': { review: 'ship', kind: 'verify_only', zeroCommits: true } } },
   blocked: { pkgs: { 'wp1': { blocked: true }, 'wp2': { review: 'ship' } } },
   vm: { pkgs: { 'wp1': { review: 'ship', needs_vm: true } } },
 }
 
 async function runCase(name, C) {
-  const args = mockArgs(C.integrator || 'sonnet')
+  const args = mockArgs(C.integrator || 'sonnet', C.bookkeeping)
   const scope = args.scopes[0]
   const ids = Object.keys(C.pkgs)
   const fails = []
@@ -146,6 +157,15 @@ async function runCase(name, C) {
       check(prompt.includes('BLOCKING-' + id) && !prompt.includes('DEFERRABLE-' + id), l + ': recheck prompt is not limited to the blocking items')
       return { items: [{ index: 1, resolved: !!S.recheck, evidence: 'e' }] }
     }
+    if (l.startsWith('followups:')) {
+      check(prompt.includes("fakeglab count '[vd:demo/wp1]'"), l + ': dedupe command not wired for the wp1 tag')
+      check(prompt.includes("fakeglab count '[vd:demo/wp2]'"), l + ': dedupe command not wired for the wp2 tag')
+      check(prompt.includes('fakeglab create'), l + ': create command not wired')
+      check(prompt.includes('size::nit'), l + ': deferred-kind labels not wired')
+      check(prompt.includes('size::task'), l + ': default labels not wired')
+      // Scripted as if the fake dedupe command found wp1's tag unfiled (created) and wp2's tag already filed (dup).
+      return { ok: true, output: 'RESULT 0-0 CREATED https://forge.example/issues/101\nRESULT 1-0 DUP\n' }
+    }
     if (l.startsWith('mr-merge:')) {
       check(prompt.includes('--sha ' + mrHead), 'merge without the gated sha')
       const fu = calls.length && runFollowupTags()
@@ -224,6 +244,17 @@ async function runCase(name, C) {
     blocked: () => { check(pk.wp1.final === 'blocked' && labels.filter((x) => /^vibe:demo:wp1/.test(x)).length === 1 && !has(/^review:demo:wp1/) && pk.wp2.final === 'integrated' && sc.status === 'merged' && fuOf('wp1').some((f) => f.kind === 'not_integrated' && /blocked note .*\.vd-blocked\.md/.test(f.evidence)), 'blocked: wrong outcome or no blocked note in the follow-up') },
     vm: () => { check(pk.wp1.final === 'integrated', 'vm: not shipped') },
     'followups-missing': () => { check(sc.status === 'merged' && sc.followups_recorded === false && (sc.followups_missing || []).length === 1 && /NOT all recorded/.test(res.summary[0]), 'followups-missing: not reported') },
+    'followups-issues': () => {
+      check(sc.status === 'merged' && pk.wp1.final === 'integrated' && pk.wp2.final === 'rejected', 'followups-issues: wrong finals')
+      const f1 = fuOf('wp1')[0]
+      const f2 = fuOf('wp2')[0]
+      check(!!f1 && f1.issue_status === 'created' && f1.issue_url === 'https://forge.example/issues/101', 'followups-issues: wp1 follow-up not filed as a created issue')
+      check(!!f2 && f2.issue_status === 'duplicate' && !f2.issue_url, 'followups-issues: wp2 follow-up not recognized as a duplicate')
+      const mp = prompts['mr-prep:demo:1']
+      check(!/Add every line/.test(mp) && /filed separately/.test(mp), 'followups-issues: mr-prep prompt still tells vibe to write follow-up lines to a file')
+      const mm = prompts['mr-merge:demo']
+      check(mm.includes('Filed: https://forge.example/issues/101') && mm.includes('grep -qF') && !/git -C \S+ diff/.test(mm), 'followups-issues: mr-merge prompt lacks the issue URL, or still runs the file-mode git-diff check')
+    },
   }
   E[name]()
 

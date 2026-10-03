@@ -31,7 +31,7 @@ for (const s of A.scopes) {
   need(s.key && s.repo_path && s.brief && s.integration_branch, 'scope needs key, repo_path, brief, integration_branch')
   need(s.profile && s.profile.base_ref && s.profile.worktree_root && Array.isArray(s.profile.gates), 'scope ' + s.key + ' has no resolved profile')
   need(typeof s.profile_json === 'string', 'scope ' + s.key + ' has no profile_json path')
-  need(s.profile.bookkeeping && s.profile.bookkeeping.followup_file, 'scope ' + s.key + ' profile has no bookkeeping.followup_file')
+  need(s.profile.bookkeeping && (s.profile.bookkeeping.followup_file || s.profile.bookkeeping.followup_command), 'scope ' + s.key + ' profile has no bookkeeping.followup_file or bookkeeping.followup_command')
 }
 // Integrator: 'sonnet' (default) merges with a Sonnet agent; 'script' merges with
 // scope-branch.sh merge behind a Haiku wrapper and calls Sonnet only on a conflict.
@@ -811,9 +811,85 @@ function followupLine(f) {
     (f.file ? ' (' + f.file + (f.line ? ':' + f.line : '') + ')' : '') +
     (f.required_fix ? '. Needed: ' + f.required_fix : '') +
     (f.kind !== 'deferred' && f.evidence ? '. Evidence: ' + f.evidence : '') +
+    (f.issue_url ? '. Filed: ' + f.issue_url : f.issue_status === 'duplicate' ? '. Already filed (found by the dedupe check).' : f.issue_status === 'failed' ? '. NOT filed: the tracker command failed.' : '') +
     ' [' + followupTag(f.scope, f.package) + ']'
 }
 const followupBlock = (fus) => FOLLOWUP_HEADING + '\n\n' + (fus.length ? fus.map(followupLine).join('\n') : 'None.')
+
+// ---------------------------------------------------------------------------
+// Command mode (bookkeeping.followup_command): one tracker issue per
+// follow-up instead of a line in bookkeeping.followup_file. Runs once, right
+// after MR prep's first run delivers (the point at which file mode's vibe
+// commit would have written the lines), so issues exist regardless of
+// whether the scope later ships. Deduped per [vd:<scope>/<package>] tag
+// (followup_dedupe_command) so a re-run does not refile a package's
+// follow-ups; a whole tag's group is skipped together, since a package can
+// carry more than one follow-up under the same tag. Mutates each follow-up
+// with issue_status ('created' | 'duplicate' | 'failed') and, when created,
+// issue_url, which followupLine/followupBlock then render.
+async function fileFollowupIssues(s, setup, mdir, followups) {
+  const p = s.profile
+  const bk = p.bookkeeping
+  const groups = []
+  const byTag = new Map()
+  for (const f of followups) {
+    const t = followupTag(f.scope, f.package)
+    let g = byTag.get(t)
+    if (!g) { g = { tag: t, items: [] }; byTag.set(t, g); groups.push(g) }
+    g.items.push(f)
+  }
+  const dir = mdir + '/followups'
+  const scriptPath = mdir + '/followups.sh'
+  const lines = ['set -uo pipefail', 'cd ' + q(setup.integration_worktree), 'mkdir -p ' + q(dir)]
+  groups.forEach((g, gi) => {
+    const bracketed = '[' + g.tag + ']'
+    const nvar = 'N' + gi
+    if (bk.followup_dedupe_command) {
+      const dc = bk.followup_dedupe_command.replace(/\{tag\}/g, q(bracketed))
+      lines.push(nvar + '=$(' + dc + ' 2>&1)', nvar + '=$(printf \'%s\\n\' "$' + nvar + '" | tr -cd \'0-9\\n\' | tail -1)', ': "${' + nvar + ':=0}"')
+    } else {
+      lines.push(nvar + '=0')
+    }
+    lines.push('if [ "$' + nvar + '" -gt 0 ] 2>/dev/null; then')
+    g.items.forEach((f, ii) => lines.push('  echo "RESULT ' + gi + '-' + ii + ' DUP"'))
+    lines.push('else')
+    g.items.forEach((f, ii) => {
+      const descPath = dir + '/' + gi + '-' + ii + '.md'
+      const delim = 'FUDESC_' + gi + '_' + ii
+      const title = q(((f.kind === 'deferred' ? 'Deferred finding' : 'Not integrated') + ': ' + f.scope + '/' + f.package).slice(0, 200))
+      const labels = q((f.kind === 'deferred' && bk.followup_labels_deferred) ? bk.followup_labels_deferred : (bk.followup_labels || ''))
+      const cmd = bk.followup_command.replace(/\{title\}/g, title).replace(/\{description_file\}/g, q(descPath)).replace(/\{labels\}/g, labels)
+      const uvar = 'U' + gi + '_' + ii
+      const rcvar = 'rc' + gi + '_' + ii
+      lines.push(
+        '  cat > ' + q(descPath) + " <<'" + delim + "'",
+        followupLine(f),
+        delim,
+        '  ' + uvar + '=$(' + cmd + ' 2>&1); ' + rcvar + '=$?',
+        '  ' + uvar + '=$(printf \'%s\\n\' "$' + uvar + '" | tail -1)',
+        '  if [ "$' + rcvar + '" -eq 0 ]; then echo "RESULT ' + gi + '-' + ii + ' CREATED $' + uvar + '"; else echo "RESULT ' + gi + '-' + ii + ' FAILED $' + uvar + '"; fi',
+      )
+    })
+    lines.push('fi')
+  })
+  const script = lines.join('\n') + '\n'
+  const r = await agent(mechPrompt(
+    [WRITE_STEP(scriptPath, 'FUSCRIPT'), 'Run `bash ' + q(scriptPath) + '`.'],
+    'Return ok = true only if the script ran to completion (a RESULT line of FAILED is still completion, not a script error), and output = its entire stdout, every line, copied exactly.\n\nBEGIN-FUSCRIPT\n' + script + 'END-FUSCRIPT'
+  ), { label: 'followups:' + s.key, phase: 'MR prep', model: 'haiku', effort: 'low', schema: MECH })
+  const out = (r && typeof r.output === 'string') ? r.output : ''
+  const re = /^RESULT (\d+)-(\d+) (DUP|CREATED|FAILED)(?: (.*))?$/gm
+  let m
+  while ((m = re.exec(out))) {
+    const g = groups[Number(m[1])]
+    const f = g && g.items[Number(m[2])]
+    if (!f) continue
+    f.issue_status = m[3] === 'DUP' ? 'duplicate' : m[3] === 'CREATED' ? 'created' : 'failed'
+    if (m[3] === 'CREATED') f.issue_url = (m[4] || '').trim()
+    if (m[3] === 'FAILED') log(s.key + ': follow-up issue for ' + f.package + ' failed to file: ' + (m[4] || '').trim())
+  }
+  for (const g of groups) for (const f of g.items) if (!f.issue_status) log(s.key + ': follow-up for ' + f.package + ' got no RESULT line from the issue-filing script (treating as not filed)')
+}
 
 function mrPrompt(s, plan, setup, integrated, notIntegrated, followups, fixOf) {
   const p = s.profile
@@ -837,7 +913,9 @@ function mrPrompt(s, plan, setup, integrated, notIntegrated, followups, fixOf) {
       (p.remote ? '1. `git fetch ' + p.remote + '` then `git merge --no-edit ' + p.base_ref + '`.' : '1. `git merge --no-edit ' + p.base_ref + '`.') + ' Resolve conflicts preserving both sides\' intent; commit the merge. If you resolved conflicts in code, run the package-level gates on what you touched: `' + GT + ' run --profile ' + q(s.profile_json) + ' --wt . --base ' + q(p.base_ref) + ' --out ' + q(RUN + '/' + s.key + '/mr-prep/vibe-gates-N') + ' --level package` (N = 1, 2, ...: a new out dir each time). Do not run the full gates: they run once after you, mechanically.',
       '2. Bookkeeping in ' + p.bookkeeping.files.join(', ') + ': tick the entries this scope completed, with completion notes (' + p.bookkeeping.convention + '). Leave the entries of packages that were not integrated unticked. Stage only your own hunks. Commit.',
       followups.length
-        ? '3. Follow-ups (mandatory: none may be left out). Add every line between BEGIN-FOLLOWUPS and END-FOLLOWUPS below to ' + p.bookkeeping.followup_file + ', where that file\'s convention puts new open items (' + p.bookkeeping.convention + '). You may adapt each line\'s form to the convention, but every entry must keep its date, scope, package, branch, finding and its trailing [vd:...] tag, which is checked mechanically. Stage only your own hunks. Commit.\nBEGIN-FOLLOWUPS\n' + followups.map(followupLine).join('\n') + '\nEND-FOLLOWUPS'
+        ? (p.bookkeeping.followup_command
+            ? '3. Follow-ups: filed separately, as tracker issues, by the workflow right after this run — not by you. Do not write them into any file; just leave them out of your commits. (Listed below for the description in step 5.)\nBEGIN-FOLLOWUPS\n' + followups.map(followupLine).join('\n') + '\nEND-FOLLOWUPS'
+            : '3. Follow-ups (mandatory: none may be left out). Add every line between BEGIN-FOLLOWUPS and END-FOLLOWUPS below to ' + p.bookkeeping.followup_file + ', where that file\'s convention puts new open items (' + p.bookkeeping.convention + '). You may adapt each line\'s form to the convention, but every entry must keep its date, scope, package, branch, finding and its trailing [vd:...] tag, which is checked mechanically. Stage only your own hunks. Commit.\nBEGIN-FOLLOWUPS\n' + followups.map(followupLine).join('\n') + '\nEND-FOLLOWUPS')
         : '3. There are no follow-ups to file.',
       p.no_remote ? '4. This repo has no remote: do not push.' : '4. Push the integration branch, and only it: `git push -u ' + p.remote + ' ' + setup.integration_branch + '`.',
       '5. Write the merge request description to ' + RUN + '/' + s.key + '/mr-prep/description.md (outside the repository): what changed, the packages (integrated, verified without changes, and not integrated), and anything not done. Then a "' + FOLLOWUP_HEADING + '" section holding exactly the follow-up lines above (or "None."). Leave a final "## Gates" heading empty: the mechanical full-gate results are appended after you. Every claim must be checkable against the diff; write nothing you have not verified. Starting point: ' + JSON.stringify(plan.mr_description),
@@ -965,11 +1043,14 @@ async function runScope(pl) {
 
   // ---- MR PREP (vibe), then the full gates once, mechanically; one fix run if they fail ----
   const mdir = RUN + '/' + key + '/mr-prep'
-  const allowed = [].concat(...integrated.map((r) => (allPackages(plan).find((k) => k.id === r.id) || { files: [] }).files), p.bookkeeping.files, [p.bookkeeping.plan_entry_file, p.bookkeeping.followup_file])
+  const allowed = [].concat(...integrated.map((r) => (allPackages(plan).find((k) => k.id === r.id) || { files: [] }).files), p.bookkeeping.files, [p.bookkeeping.plan_entry_file, p.bookkeeping.followup_file].filter(Boolean))
   // The full gates diff the branch against the base ref: inherited work is allowed by file.
   const inheritedAllow = setup.base.inherited && setup.base.files_file ? setup.base.files_file : ''
   const G = guards(s)
   let mr = await vibeRun({ label: 'mr-prep:' + key + ':1', phase: 'MR prep', wt: setup.integration_worktree, base: setup.head, promptFile: mdir + '/run1/prompt.md', promptText: mrPrompt(s, plan, setup, integrated, notIntegrated, followups, null), out: mdir + '/run1', allow: ['*'], expectCommits: 'yes', guardRefs: G.guardRefs, mrCheckCmd: G.mrCheckCmd })
+  // Command mode: file every follow-up as a tracker issue now, at the same point file mode's
+  // vibe commit would have written the lines, so issues exist whether or not the scope later ships.
+  if (mr.delivered && p.bookkeeping.followup_command && followups.length) await fileFollowupIssues(s, setup, mdir, followups)
   let full = mr.delivered ? await gatesRun({ label: 'gates:' + key + ':full:1', phase: 'MR prep', wt: setup.integration_worktree, base: p.base_ref, out: mdir + '/gates-full-1', level: 'full', profileJson: s.profile_json, allow: allowed, allowFile: inheritedAllow }) : null
   const mrRuns = [mr]
   if (mr.delivered && full && !full.ok && !(mr.policy_violations || []).length) {
@@ -1010,7 +1091,12 @@ async function runScope(pl) {
   const mergeCmd = p.merge.command.replace(/\{sha\}/g, full.head)
   // Follow-ups must be visible but never stop the merge: the check is reported, not gated.
   const tags = [...new Set(followups.map((f) => followupTag(f.scope, f.package)))]
-  const fuCheck = tags.length ? 'for t in ' + tags.map(q).join(' ') + '; do git -C ' + q(setup.integration_worktree) + ' diff ' + setup.gates_base + ' ' + full.head + ' -- ' + q(p.bookkeeping.followup_file) + ' | grep \'^+\' | grep -qF -- "$t" || echo "MISSING $t"; done; echo FOLLOWUPS_CHECKED' : ''
+  // File mode: the tag must appear in a line the branch's diff added to followup_file. Command mode: nothing is
+  // committed for a follow-up, so this checks the MR description's own "Deferred / follow-ups" section instead,
+  // which step 3 below makes hold every tag (issues themselves were already filed, deterministically, above).
+  const fuCheck = !tags.length ? '' : p.bookkeeping.followup_command
+    ? 'for t in ' + tags.map(q).join(' ') + '; do grep -qF -- "$t" ' + q(mdir + '/description.md') + ' || echo "MISSING $t"; done; echo FOLLOWUPS_CHECKED'
+    : 'for t in ' + tags.map(q).join(' ') + '; do git -C ' + q(setup.integration_worktree) + ' diff ' + setup.gates_base + ' ' + full.head + ' -- ' + q(p.bookkeeping.followup_file) + ' | grep \'^+\' | grep -qF -- "$t" || echo "MISSING $t"; done; echo FOLLOWUPS_CHECKED'
   const merged = await agent([
     'You are the MR MERGE stage for scope "' + key + '": the only stage allowed to open and merge a merge request. Every gate has been checked mechanically; do not change code, bookkeeping or branches. Work from ' + setup.integration_worktree + '.',
     '1. `git ls-remote ' + q(p.remote) + ' refs/heads/' + s.integration_branch + '` must print ' + full.head + '. If not, stop: merged=false.',
@@ -1033,7 +1119,7 @@ async function runScope(pl) {
     out.followups_recorded = !missing.length
     if (missing.length) {
       out.followups_missing = missing
-      log(key + ': follow-ups not found in ' + p.bookkeeping.followup_file + ': ' + missing.join(', ') + ' (file them by hand from the result)')
+      log(key + ': follow-ups not found in ' + (p.bookkeeping.followup_file || 'the MR description') + ': ' + missing.join(', ') + ' (file them by hand from the result)')
     }
   }
   out.status = merged && merged.merged ? 'merged' : 'needs_owner_decision'
