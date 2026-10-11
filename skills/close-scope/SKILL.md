@@ -27,8 +27,8 @@ Files here: `scope-decompose.workflow.js` (A), `close-scope.workflow.js` (B). Bo
 ## 3. DELIVER (workflow B)
 `Workflow({scriptPath: <this dir>/close-scope.workflow.js, args})`. Per block, ~5 lanes in parallel:
 1. **Plan.** Sonnet/xhigh. `low` risk: stop at one call. `high` risk: <=4 parallel grounding lookups, one align call, one codex opinion (run and resolved by the same agent), vibe tie-break on disputed points only.
-2. **Implement.** Sonnet/high in its own worktree, tests first, inside the declared files.
-3. **Review loop** (<=3 rounds). Gates and codex adversarial review run concurrently; later rounds review only the fix diff and re-check only open blocking items. Disputes go to vibe once.
+2. **Implement.** Sonnet/high in its own worktree, tests first, inside the declared files. A block with `depends_on` starts only when every dependency is `mr_open` and (with `as-ready`) merged; otherwise it ends `blocked_by_dependency` with the dependency's reason. After implementing, a cheap check confirms the worktree is listed and the branch has commits ahead of base, else `impl_failed`.
+3. **Review loop** (<=3 rounds). Gates and codex adversarial review run concurrently; later rounds review only the fix diff and re-check only open blocking items. Disputes go to vibe once. Scope is diffed against the merge-base (`base...HEAD`) after a fetch. A review that did not run (`ran=false`) is retried once and never counts as a round; if it still cannot run the block ends `review_unavailable`, not clean and not `blocking_open`.
 4. **MR**, then a **serial merge lane**: sync default branch, re-run only what the merge changed (nothing if the default branch has not moved), merge pinned to the head sha.
 5. **Triage** per round: dedupe against open issues; promote only production-critical/meaningful findings tied to scope as next-round blocks (<=3 rounds); the rest is one consolidated backlog issue per theme.
 6. **Close-out critic** works from the run's own ledger, not by re-reading code. Done = every acceptance criterion evidenced on the default branch, every MR merged, no such issue open.

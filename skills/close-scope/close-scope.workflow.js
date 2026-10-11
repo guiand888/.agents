@@ -145,43 +145,74 @@ async function planBlock(b) {
 
 async function deliverBlock(b) {
   const plan = await planBlock(b)
-  if (!plan) return { id: b.id, status: 'plan_failed', newIssues: [] }
-  if (plan.needs_decision) return { id: b.id, status: 'parked', needs_decision: plan.needs_decision, newIssues: [] }  // reported in final batch, other blocks continue
+  if (!plan) return { id: b.id, status: 'plan_failed', reason: 'planner returned no plan', newIssues: [] }
+  if (plan.needs_decision) return { id: b.id, status: 'parked', needs_decision: plan.needs_decision, reason: `needs_decision: ${plan.needs_decision}`, newIssues: [] }  // reported in final batch, other blocks continue
   const branch = `${args.branchPrefix}/${b.id}`
   const base = b.base || args.baseRef || 'origin/master'
   b.worktree = `${args.worktreeRoot}/${args.runTag}-${b.id}`
 
   phase('Implement')
+  // Fix 2 (observed: dependents implemented on a stale base after their prerequisite merged): fetch first so ${base} is current.
   await agent(`${HOUSE}\n\nImplement the approved plan for ${b.id} test-first, per the repo's CLAUDE.md, exactly within these files: ${plan.files.join(', ')}.\n` +
-    `Create your tree with: git -C ${args.repo} worktree add -b ${branch} ${b.worktree} ${base}\n` +
+    `Create your tree with: git -C ${args.repo} fetch origin && git -C ${args.repo} worktree add -b ${branch} ${b.worktree} ${base}\n` +
     `Commit in small steps, conventional messages. Plan: ${JSON.stringify(plan)}`,
     { phase: 'Implement', label: `impl:${b.id}`, model: 'sonnet', effort: 'high' })
 
+  // Fix 4 (observed: implementers wrote drafts to a cache dir because `git worktree add` never ran or failed, and the run carried on):
+  // a separate cheap agent checks the facts; the script decides. No worktree / wrong branch / no commits ahead of base = impl_failed.
+  const IMPL = { type: 'object', required: ['listed', 'branch', 'ahead'], properties: {
+    listed: { type: 'boolean' }, branch: { type: 'string' }, ahead: { type: 'number' }, head: { type: 'string' } } }
+  const iv = await agent(`${HOUSE}\n\nVerify the implementation worktree exists. Report only what these commands print: ` +
+    `(1) git -C ${args.repo} worktree list --porcelain: listed=true only if ${b.worktree} is one of the worktree paths (compare real paths); ` +
+    `(2) git -C ${b.worktree} rev-parse --abbrev-ref HEAD: branch; (3) git -C ${b.worktree} rev-list --count ${base}..HEAD: ahead; ` +
+    `(4) git -C ${b.worktree} rev-parse HEAD: head. If ${b.worktree} does not exist, listed=false, branch='', ahead=0.`,
+    { phase: 'Implement', label: `impl-check:${b.id}`, effort: 'low', schema: IMPL })
+  if (!iv || !iv.listed || iv.branch !== branch || !(iv.ahead > 0))
+    return { id: b.id, status: 'impl_failed', branch, newIssues: [],
+      reason: iv ? `worktree ${b.worktree} listed=${iv.listed}, branch=${JSON.stringify(iv.branch)} (want ${branch}), commits ahead of ${base}=${iv.ahead}`
+                 : `implementation check for ${b.worktree} returned no result` }
+
   // Mechanical facts, not the implementer's word: run the gates the repo's CLAUDE.md prescribes for the touched paths (package level,
   // not the full suite), and list files changed since the fork that are outside the plan's declared files.
-  const gate = () => agent(`${HOUSE}\n\nIn ${b.worktree}: run the repo's gates for the paths touched since ${base} (package level, per CLAUDE.md), and ` +
-    `list files changed since the fork (git diff --name-only ${base}..HEAD) that are outside ${JSON.stringify(plan.files)}. Return head=git rev-parse HEAD. Report only what the commands print.`,
+  // Fix 1 (observed: once origin/master moved, `${base}..HEAD` listed master-only files as out_of_scope and blocked every block forever):
+  // fetch so ${base} is current, then diff against the merge-base (three dots), which is only this branch's own changes.
+  const gate = () => agent(`${HOUSE}\n\nIn ${b.worktree}: run \`git fetch origin\` first, then run the repo's gates for the paths touched since ${base} (package level, per CLAUDE.md), and ` +
+    `list files changed on this branch since it forked (git diff --name-only ${base}...HEAD, three dots: merge-base diff) that are outside ${JSON.stringify(plan.files)}. Return head=git rev-parse HEAD. Report only what the commands print.`,
     { phase: 'Implement', label: `gate:${b.id}`, effort: 'low', schema: GATE })
 
   // Review loop. Round 0 reviews the whole branch; later rounds review ONLY the fix diff and re-check ONLY the open blocking items.
   // A finding already seen (by id/point) is never re-litigated. Gates and review run concurrently (disjoint, both read-only).
-  const EVAL = { type: 'object', required: ['findings'], properties: { findings: { type: 'array', items: { type: 'object',
+  // Fix 3 (observed: reviewers reporting "codex produced no output" / "worktree and branch do not exist" still consumed a round, and three
+  // such rounds ended blocking_open): `ran` + `reviewed_head` are required, and a review that evaluated nothing is never a round.
+  const EVAL = { type: 'object', required: ['ran', 'reviewed_head', 'findings'], properties: {
+    ran: { type: 'boolean' }, reviewed_head: { type: 'string' }, reason: { type: 'string' },
+    findings: { type: 'array', items: { type: 'object',
     required: ['id', 'point', 'severity', 'tied_to_scope', 'verdict'], properties: {
       id: { type: 'string' }, point: { type: 'string' }, file: { type: 'string' },
       severity: { type: 'string', enum: ['production-critical', 'production-meaningful', 'polish'] },
       tied_to_scope: { type: 'boolean' }, verdict: { type: 'string', enum: ['accept', 'dispute'] }, evidence: { type: 'string' } } } } } }
-  let blockedOpen = false, reviewedBase = base, open = []
+  let blockedOpen = false, reviewedBase = base, open = [], lastG = null
   const deferred = [], seen = []
+  const review = (r, tag) => agent(`${HOUSE}\n\nRun once and read its output:\nnode ${CODEX} adversarial-review --wait --model ${MODEL} --base ${reviewedBase} --cwd ${b.worktree} "Plan: ${plan.summary.replace(/"/g, "'")}"\n` +
+    (r === 0 ? '' : `This is a re-review of a FIX diff only. Previously blocking items to re-check: ${JSON.stringify(open)}. Do not re-report anything in: ${JSON.stringify(seen)}.\n`) +
+    'Then evaluate each finding on its merits against the code: verdict=accept, or dispute with concrete evidence. Classify severity and whether it is tied to this scope. ' +
+    `Set reviewed_head to the output of git -C ${b.worktree} rev-parse HEAD. Set ran=true ONLY if the review command actually executed in ${b.worktree} and printed a verdict; ` +
+    'if it produced no output, errored, timed out, or the worktree or branch does not exist, set ran=false, findings=[] and put the reason in reason. ' +
+    'Never report an empty review as clean when it did not run. Do not spawn anything else.',
+    { phase: 'Review', label: `review:${b.id}:${r}${tag}`, model: 'sonnet', effort: 'high', schema: EVAL })
+  // The reviewer's own claim is checked against the gate's head: a review of another tree evaluated nothing.
+  const reviewOk = (e, g) => !!(e && e.ran && e.reviewed_head && !(g && g.head && !(g.head.startsWith(e.reviewed_head) || e.reviewed_head.startsWith(g.head))))
+  const whyNot = (e, g) => !e ? 'review agent returned no result' : !e.ran ? `review did not run: ${e.reason || 'no reason given'}`
+    : !e.reviewed_head ? 'review reported no reviewed_head' : `reviewed_head ${e.reviewed_head} != worktree head ${g && g.head}`
   for (let r = 0; r < args.maxReviewRounds; r++) {
-    const [g, ev] = await parallel([
-      () => gate(),
-      () => agent(`${HOUSE}\n\nRun once and read its output:\nnode ${CODEX} adversarial-review --wait --model ${MODEL} --base ${reviewedBase} --cwd ${b.worktree} "Plan: ${plan.summary.replace(/"/g, "'")}"\n` +
-        (r === 0 ? '' : `This is a re-review of a FIX diff only. Previously blocking items to re-check: ${JSON.stringify(open)}. Do not re-report anything in: ${JSON.stringify(seen)}.\n`) +
-        'Then evaluate each finding on its merits against the code: verdict=accept, or dispute with concrete evidence. Classify severity and whether it is tied to this scope. ' +
-        'Do not spawn anything else.', { phase: 'Review', label: `review:${b.id}:${r}`, model: 'sonnet', effort: 'high', schema: EVAL }),
-    ])
+    const [g, ev0] = await parallel([() => gate(), () => review(r, '')])
+    let ev = ev0
+    if (!reviewOk(ev, g)) ev = await review(r, ':retry')                         // does not consume a round: retry once in place
+    if (!reviewOk(ev, g)) return { id: b.id, status: 'review_unavailable', branch, newIssues: deferred,
+      reason: `round ${r}: ${whyNot(ev0, g)}; retry: ${whyNot(ev, g)}` }
+    lastG = g
     reviewedBase = g && g.head ? g.head : reviewedBase
-    const fs = ev ? ev.findings : []
+    const fs = ev.findings
     fs.forEach(f => seen.push({ id: f.id, point: f.point }))
     const disputed = fs.filter(f => f.verdict === 'dispute').map(f => ({ id: f.id, my_position: f.evidence || '', their_position: f.point }))
     let codexRight = []
@@ -196,12 +227,14 @@ async function deliverBlock(b) {
     await agent(`${HOUSE}\n\nFix exactly these blocking items in ${b.worktree}, nothing else, then commit:\n${JSON.stringify({ must, gates: g })}`,
       { phase: 'Review', label: `fix:${b.id}:${r}`, model: 'sonnet', effort: 'high' })
   }
-  if (blockedOpen) return { id: b.id, status: 'blocking_open', branch, newIssues: deferred }
+  if (blockedOpen) return { id: b.id, status: 'blocking_open', branch, newIssues: deferred,   // Fix 5: say why, so the owner can see it
+    reason: `still blocking after ${args.maxReviewRounds} review round(s): open=${JSON.stringify(open.map(f => f.id))} ` +
+      `gate_failing=${JSON.stringify(lastG ? lastG.failing : [])} out_of_scope=${JSON.stringify(lastG ? lastG.out_of_scope : [])}` }
 
   phase('Merge')
   const mr = await agent(`${HOUSE}\n\nPush ${branch} from ${b.worktree} and open the MR to the default branch using the repo's documented procedure (CLAUDE.md, docs/how-to, or the profile). ` +
     `Title/description from the plan; epic ${args.epic}. Return iid and head sha.`, { phase: 'Merge', label: `mr:${b.id}`, model: 'sonnet', effort: 'high', schema: MR })
-  if (!mr) return { id: b.id, status: 'mr_failed', branch, newIssues: deferred }
+  if (!mr) return { id: b.id, status: 'mr_failed', branch, reason: 'MR agent returned no iid/sha', newIssues: deferred }
   const out = { id: b.id, status: 'mr_open', branch, mr, newIssues: deferred, worktree: b.worktree }
   if (args.mergeTiming === 'as-ready') out.merge = await mergeOne(out)
   return out
@@ -220,11 +253,39 @@ const results = []
 let queue = args.blocks.map(b => ({ ...b }))
 for (let round = 1; round <= args.maxDiscoveryRounds && queue.length; round++) {
   log(`round ${round}: ${queue.length} block(s): ${queue.map(b => b.id).join(', ')}`)
-  const donePromises = {}
-  const roundResults = await parallel(queue.map(b => () => lane(async () => {
-    await Promise.all((b.depends_on || []).map(d => donePromises[d]).filter(Boolean))   // dependency order inside the round
-    const p = deliverBlock(b); donePromises[b.id] = p.catch(() => null); return p
-  })))
+  // Fix 2 (observed: dependents ran as soon as their dependency's deliverBlock RETURNED, whatever its status, so app-rules merged and
+  // three more blocks were implemented on a stale base while their prerequisite never merged). A dependent now runs only if every
+  // dependency ended mr_open (and, when merging as-ready, merged); otherwise it is blocked_by_dependency and never plans or implements.
+  // Promises exist for every block up front (the old map only had the ones already started, so an early dependent did not wait at all)
+  // and the wait happens before taking a lane slot, so waiting dependents cannot starve the dependencies of lanes.
+  const donePromises = {}, settle = {}, byId = {}
+  queue.forEach(b => { byId[b.id] = b; donePromises[b.id] = new Promise(res => { settle[b.id] = res }) })
+  const inRound = id => Object.prototype.hasOwnProperty.call(byId, id)
+  const prior = id => results.filter(r => r.id === id).pop()
+  const depsOf = id => ((byId[id] || {}).depends_on || []).filter(inRound)
+  const inCycle = id => { const seen = new Set(), st = [...depsOf(id)]
+    while (st.length) { const n = st.pop(); if (n === id) return true; if (!seen.has(n)) { seen.add(n); st.push(...depsOf(n)) } }
+    return false }
+  const satisfied = r => !!r && r.status === 'mr_open' && (args.mergeTiming !== 'as-ready' || !!(r.merge && r.merge.merged === true))
+  const why = r => !r ? 'no result' : [r.status, r.reason || (r.needs_decision && `needs_decision: ${r.needs_decision}`) ||
+    (r.status === 'mr_open' && `not merged${r.merge && r.merge.reason ? `: ${r.merge.reason}` : ''}`) || ''].filter(Boolean).join(': ')
+  const roundResults = await parallel(queue.map(b => async () => {
+    let res = null
+    try {
+      const ds = (b.depends_on || []).filter(d => inRound(d) || prior(d))             // an id unknown to this run is not a gate (as before)
+      if (inCycle(b.id)) res = { id: b.id, status: 'blocked_by_dependency', blockedOn: depsOf(b.id), reason: 'dependency cycle among blocks', newIssues: [] }
+      else {
+        const got = await Promise.all(ds.map(d => inRound(d) ? donePromises[d] : prior(d)))
+        const bad = ds.map((d, i) => ({ d, r: got[i] })).filter(x => !satisfied(x.r))
+        if (bad.length) {
+          res = { id: b.id, status: 'blocked_by_dependency', blockedOn: bad.map(x => x.d), newIssues: [],
+            reason: bad.map(x => `${x.d} ${why(x.r)}`).join('; ') }
+          log(`block ${b.id} blocked by dependency: ${res.reason}`)
+        } else res = await lane(() => deliverBlock(b))                                  // no dependencies: straight to a lane, as before
+      }
+    } finally { settle[b.id](res) }                                                      // always settle, or dependents would wait forever
+    return res
+  }))
   const ok = roundResults.filter(Boolean); results.push(...ok)
 
   if (args.mergeTiming === 'end') for (const o of ok.filter(x => x.status === 'mr_open')) o.merge = await mergeOne(o)
@@ -240,10 +301,14 @@ for (let round = 1; round <= args.maxDiscoveryRounds && queue.length; round++) {
 
 phase('Close-out')
 // The critic works from this run's own ledger (merged shas, gate results, plan acceptance lists), not by re-reading the code.
-const ledgerOut = results.map(r => ({ id: r.id, status: r.status, mr: r.mr && r.mr.iid, merged: r.merge && r.merge.merged, sha: r.merge && r.merge.master_sha }))
+const ledgerOut = results.map(r => ({ id: r.id, status: r.status, blockedOn: r.blockedOn, reason: r.reason || (r.merge && !r.merge.merged ? r.merge.reason : undefined),
+  mr: r.mr && r.mr.iid, merged: r.merge && r.merge.merged, sha: r.merge && r.merge.master_sha }))
 const final = await agent(`${HOUSE}\n\nCompleteness critic. Scope: ${JSON.stringify(args.scope)}. Run ledger: ${JSON.stringify(ledgerOut)}. ` +
   'Map each acceptance criterion to a merged block in the ledger and confirm with ONE targeted check each (the named test exists on master). ' +
   `List open GitLab issues under epic ${args.epic} that are production-critical/meaningful (jq-select fields only). Return done=true only if every ` +
   'criterion is evidenced, every MR of this run is merged, and no such issue is open; otherwise list gaps as blocks.',
   { phase: 'Close-out', label: 'critic', model: 'sonnet', effort: 'high', schema: DONE })
-return { done: !!(final && final.done && !queue.length), gaps: final ? final.gaps : null, unpromoted: queue, results }
+// Fix 5 (observed: the owner could not see why nothing merged): per-block status plus blockedOn/reason; a block that is not merged keeps done=false.
+const blocks = ledgerOut.map(r => ({ ...r, needs_decision: (results.find(x => x.id === r.id) || {}).needs_decision }))
+const unresolved = blocks.filter(x => !(x.status === 'mr_open' && x.merged === true)).map(x => x.id)
+return { done: !!(final && final.done && !queue.length && !unresolved.length), gaps: final ? final.gaps : null, unpromoted: queue, blocks, unresolved, results }
